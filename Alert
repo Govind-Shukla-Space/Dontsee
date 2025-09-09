@@ -1,103 +1,105 @@
-alert
 """
-Weather Alert Producer
-Consumes messages from `weather.readings`,
-checks hazard conditions, and publishes alerts to `weather.alerts`
+Weather Alert Producer - Milestone 2
+Consumes raw weather readings from Kafka, detects hazards, and publishes alerts to weather.alerts
 """
 
 import json
-import re
 from kafka import KafkaConsumer, KafkaProducer
 
 READINGS_TOPIC = "weather.readings"
 ALERTS_TOPIC = "weather.alerts"
+BOOTSTRAP_SERVERS = ["localhost:9092"]
 
-def parse_number(value, pattern=r"([-+]?\d*\.?\d+)"):
-    """Extract numeric value from a string like '30 km/h' or '35mm'"""
-    match = re.search(pattern, str(value))
-    return float(match.group(1)) if match else None
+def create_consumer():
+    return KafkaConsumer(
+        READINGS_TOPIC,
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        auto_offset_reset="earliest",
+        enable_auto_commit=True,
+        group_id="alert-producer-group",
+        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+    )
+
+def create_producer():
+    return KafkaProducer(
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+    )
 
 def detect_alerts(record):
-    """Check conditions and return alert messages (if any)"""
     alerts = []
-    temp = parse_number(record.get("temperature"))
-    humidity = parse_number(record.get("humidity"))
-    wind = parse_number(record.get("wind_speed"))
-    precip = parse_number(record.get("precipitation"))
-    pressure = parse_number(record.get("pressure"))
+    try:
+        # Extract & clean values
+        temperature = int(str(record.get("temperature", "0")).split()[0])
+        humidity = int(str(record.get("humidity", "0")).replace("%", ""))
+        wind_speed = int(str(record.get("wind_speed", "0")).split()[0])
+        precipitation = int(str(record.get("precipitation", "0")).split()[0])
 
-    if wind and wind > 70:
-        alerts.append("⚠️ High Wind Alert")
-    if precip and precip > 30:
-        alerts.append("⚠️ Flood Warning")
-    if wind and precip and wind > 50 and precip > 20:
-        alerts.append("⚠️ Storm Warning")
-    if temp is not None and (temp < -20 or temp > 40):
-        alerts.append("⚠️ Extreme Temperature")
+        # Rules
+        if wind_speed > 70:
+            alerts.append("🌪️ High Wind Alert")
+        if precipitation > 30:
+            alerts.append("🌊 Flood Warning")
+        if wind_speed > 50 and precipitation > 20:
+            alerts.append("⛈️ Storm Warning")
+        if temperature < -20 or temperature > 40:
+            alerts.append("🔥 Extreme Temperature")
+
+    except Exception as e:
+        print("⚠️ Error parsing record:", e)
 
     return alerts
 
 if __name__ == "__main__":
-    print("🚀 Starting Weather Alert Producer...")
+    consumer = create_consumer()
+    producer = create_producer()
 
-    consumer = KafkaConsumer(
-        READINGS_TOPIC,
-        bootstrap_servers="localhost:9092",
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-        auto_offset_reset="latest",
-        enable_auto_commit=True
-    )
-
-    producer = KafkaProducer(
-        bootstrap_servers="localhost:9092",
-        value_serializer=lambda v: json.dumps(v).encode("utf-8")
-    )
-
-    for msg in consumer:
-        record = msg.value
+    print(f"📡 Listening for weather readings on {READINGS_TOPIC}...")
+    for message in consumer:
+        record = message.value
         alerts = detect_alerts(record)
 
-        if alerts:
-            for alert in alerts:
-                alert_message = {
-                    "station_id": record.get("station_id"),
-                    "location": record.get("location"),
-                    "reading_timestamp": record.get("reading_timestamp"),
-                    "alert": alert
-                }
-                producer.send(ALERTS_TOPIC, value=alert_message)
-                producer.flush()
-                print(f"🚨 ALERT PUBLISHED: {alert_message}")
+        for alert in alerts:
+            alert_msg = {
+                "station_id": record.get("station_id"),
+                "location": record.get("location"),
+                "alert": alert,
+                "reading": record,
+            }
+            producer.send(ALERTS_TOPIC, alert_msg)
+            print("🚨 ALERT Published:", alert_msg)
 
-
-alertconsume
+    producer.flush()
+vi sumer 
 """
-Alert Consumer
-Consumes messages from `weather.alerts`
-Displays them in human-readable format
+Alert Consumer - Milestone 2
+Consumes alerts from Kafka topic: weather.alerts and prints them
 """
 
 import json
 from kafka import KafkaConsumer
 
 ALERTS_TOPIC = "weather.alerts"
+BOOTSTRAP_SERVERS = ["localhost:9092"]
 
-if __name__ == "__main__":
-    print("🚨 Starting Alert Consumer...")
-
-    consumer = KafkaConsumer(
+def create_consumer():
+    return KafkaConsumer(
         ALERTS_TOPIC,
-        bootstrap_servers="localhost:9092",
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        auto_offset_reset="earliest",
+        enable_auto_commit=True,
+        group_id="alert-consumer-group",
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-        auto_offset_reset="latest",
-        enable_auto_commit=True
     )
 
-    for msg in consumer:
-        alert = msg.value
-        print(
-            f"[ALERT] {alert['alert']} | "
-            f"Station: {alert['station_id']} | "
-            f"Location: {alert['location']} | "
-            f"Time: {alert['reading_timestamp']}"
-        )
+if __name__ == "__main__":
+    consumer = create_consumer()
+
+    print(f"🚨 Listening for emergency alerts on {ALERTS_TOPIC}...")
+    for message in consumer:
+        alert = message.value
+        print(f"\n🚨 EMERGENCY ALERT 🚨")
+        print(f"📍 Station: {alert['station_id']} ({alert['location']})")
+        print(f"⚠️  Type: {alert['alert']}")
+        print(f"🌤️  Reading: {alert['reading']}")
+        print("-" * 50)
