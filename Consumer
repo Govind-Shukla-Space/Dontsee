@@ -1,0 +1,83 @@
+"""
+Weather Consumer
+Consumes weather readings from Kafka
+Logs messages to console
+Uses PySpark Structured Streaming
+"""
+
+from pyspark.sql import SparkSession
+
+TOPIC = "weather.readings"
+
+if __name__ == "__main__":
+    print("Starting Weather Consumer...")
+
+    spark = SparkSession.builder \
+        .appName("WeatherConsumer") \
+        .master("local[*]") \
+        .getOrCreate()
+
+    spark.sparkContext.setLogLevel("WARN")
+
+    # Read from Kafka
+    df = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", "localhost:9092") \
+        .option("subscribe", TOPIC) \
+        .option("startingOffsets", "latest") \
+        .load()
+
+    weather_df = df.selectExpr("CAST(value AS STRING) as message")
+
+    query = weather_df.writeStream \
+        .outputMode("append") \
+        .format("console") \
+        .option("truncate", False) \
+        .start()
+
+    query.awaitTermination()
+
+producers 
+
+"""
+Weather Producer
+Reads weather readings from data.csv
+Publishes each row as a message to Kafka topic: weather.readings
+"""
+
+import time
+import pandas as pd
+from confluent_kafka import Producer
+
+# Kafka Configuration
+producer_config = {
+    "bootstrap.servers": "localhost:9092"
+}
+producer = Producer(producer_config)
+
+TOPIC = "weather.readings"
+
+def delivery_report(err, msg):
+    """Delivery callback"""
+    if err is not None:
+        print(f"❌ Delivery failed: {err}")
+    else:
+        print(f"✅ Sent to {msg.topic()} [{msg.partition()}] offset {msg.offset()}")
+
+if __name__ == "__main__":
+    print("Starting Weather Producer with CSV data...")
+
+    # Load CSV
+    df = pd.read_csv("data.csv")
+
+    for _, row in df.iterrows():
+        record = row.to_dict()
+        message = str(record)
+
+        # Send to Kafka
+        producer.produce(TOPIC, message, callback=delivery_report)
+        producer.flush()
+
+        time.sleep(1)  # simulate sensor interval
+
+    print("✅ Finished sending all records from CSV")
