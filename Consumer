@@ -27,60 +27,12 @@ if __name__ == "__main__":
     producer.flush()
 
 consumer
-# weather_consumer_clean.py
+# weather_alert_consumer.py
 import json
-import re
 from kafka import KafkaConsumer
 
-TOPIC = "weather.readings"
+TOPIC = "weather.alerts"
 BOOTSTRAP_SERVERS = ["localhost:9092"]
-
-def clean_temperature(temp_str):
-    if not temp_str:
-        return 0.0
-    match = re.match(r"([-+]?\d+\.?\d*)\s*([CF])", temp_str.strip(), re.I)
-    if match:
-        value, unit = float(match.group(1)), match.group(2).upper()
-        if unit == "F":  # convert F to C
-            return round((value - 32) * 5.0 / 9.0, 2)
-        return value
-    return 0.0
-
-def clean_percentage(hum_str):
-    if not hum_str:
-        return 0.0
-    match = re.match(r"(\d+)", hum_str.strip())
-    return float(match.group(1)) if match else 0.0
-
-def clean_wind(wind_str):
-    if not wind_str:
-        return 0.0
-    match = re.match(r"(\d+\.?\d*)\s*km/h", wind_str.strip(), re.I)
-    return float(match.group(1)) if match else 0.0
-
-def clean_precipitation(precip_str):
-    if not precip_str:
-        return 0.0
-    match = re.match(r"(\d+\.?\d*)\s*mm/h", precip_str.strip(), re.I)
-    return float(match.group(1)) if match else 0.0
-
-def clean_pressure(press_str):
-    if not press_str:
-        return 1013.0  # default normal pressure
-    match = re.match(r"(\d+\.?\d*)\s*hPa", press_str.strip(), re.I)
-    return float(match.group(1)) if match else 1013.0
-
-def process_record(record):
-    return {
-        "station_id": record.get("station_id", "UNKNOWN"),
-        "temperature_c": clean_temperature(record.get("temperature")),
-        "humidity_percent": clean_percentage(record.get("humidity")),
-        "wind_speed_kmh": clean_wind(record.get("wind_speed")),
-        "precip_mm": clean_precipitation(record.get("precipitation")),
-        "pressure_hpa": clean_pressure(record.get("pressure")),
-        "location": record.get("location", "UNKNOWN"),
-        "reading_timestamp": record.get("reading_timestamp", "1970-01-01 00:00:00"),
-    }
 
 def create_consumer():
     return KafkaConsumer(
@@ -88,13 +40,23 @@ def create_consumer():
         bootstrap_servers=BOOTSTRAP_SERVERS,
         auto_offset_reset="earliest",
         enable_auto_commit=True,
-        group_id="weather-clean-consumer",
+        group_id="alert-clean-consumer",
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
     )
 
 if __name__ == "__main__":
     consumer = create_consumer()
-    print("📡 Listening for raw weather readings and cleaning them...")
+    print("📡 Listening for emergency alerts...")
     for msg in consumer:
-        cleaned = process_record(msg.value)
-        print("🧹 Cleaned Data:", cleaned)
+        alert = msg.value
+        print("\n🚨 EMERGENCY ALERT 🚨")
+        print(f"Station: {alert.get('station_id', 'UNKNOWN')}")
+        print(f"Location: {alert.get('location', 'UNKNOWN')}")
+
+        # Defensive: check if "alerts" key exists
+        if "alerts" in alert:
+            print(f"Alerts: {', '.join(alert['alerts'])}")
+        else:
+            print("Alerts: NONE (invalid or malformed message)")
+
+        print(f"Timestamp: {alert.get('reading_timestamp', 'N/A')}")
