@@ -1,65 +1,55 @@
 """
-Weather Producer - Milestone 1 (PySpark Streaming)
-Simulates IoT devices by sending JSON weather data row by row into Kafka topic: weather.readings
+Weather Producer
+Reads weather readings from data.json
+Publishes each record as a message to Kafka topic: weather.readings
 """
 
+import time
 import json
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import expr, to_json, struct
+from kafka import KafkaProducer
 
 TOPIC = "weather.readings"
 
 if __name__ == "__main__":
-    spark = SparkSession.builder \
-        .appName("WeatherProducer") \
-        .master("local[*]") \
-        .getOrCreate()
+    print("🚀 Starting Weather Producer with JSON data...")
 
-    spark.sparkContext.setLogLevel("WARN")
-
-    # Load static dataset (all weather records)
-    static_df = spark.read.json("data.json")
-
-    # Add a monotonically increasing id column
-    static_df = static_df.withColumn("id", expr("monotonically_increasing_id()"))
-
-    # Use Spark "rate" source to simulate streaming ticks (1 row per second)
-    rate_df = spark.readStream \
-        .format("rate") \
-        .option("rowsPerSecond", 1) \
-        .load() \
-        .withColumnRenamed("value", "id")
-
-    # Join the ticking rate with static dataset on id
-    streaming_df = rate_df.join(static_df, "id")
-
-    # Convert row to JSON for Kafka
-    kafka_df = streaming_df.select(
-        to_json(struct([col for col in static_df.columns])).alias("value")
+    # Initialize Kafka producer
+    producer = KafkaProducer(
+        bootstrap_servers="localhost:9092",
+        value_serializer=lambda v: json.dumps(v).encode("utf-8")
     )
 
-    # Write to Kafka topic
-    query = kafka_df.writeStream \
-        .format("kafka") \
-        .option("kafka.bootstrap.servers", "localhost:9092") \
-        .option("topic", TOPIC) \
-        .option("checkpointLocation", "./chk-weather-producer") \
-        .start()
+    # Load JSON file
+    with open("data.json", "r") as f:
+        records = json.load(f)
 
-    query.awaitTermination()
+    for record in records:
+        # Send message to Kafka
+        producer.send(TOPIC, value=record)
+        producer.flush()
+        print(f"✅ Sent: {record}")
+
+        time.sleep(1)  # simulate sensor interval
+
+    print("✅ Finished sending all records from JSON")
+    producer.close()
+
 
 consumer
 """
-Weather Consumer - Milestone 1 (PySpark version)
-Consumes messages from Kafka topic: weather.readings
+Weather Consumer
+Consumes weather readings from Kafka
+Logs messages to console
+Uses PySpark Structured Streaming
 """
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
 
 TOPIC = "weather.readings"
 
 if __name__ == "__main__":
+    print("🚀 Starting Weather Consumer...")
+
     spark = SparkSession.builder \
         .appName("WeatherConsumer") \
         .master("local[*]") \
@@ -67,7 +57,7 @@ if __name__ == "__main__":
 
     spark.sparkContext.setLogLevel("WARN")
 
-    # Read stream from Kafka
+    # Read from Kafka
     df = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", "localhost:9092") \
@@ -75,13 +65,15 @@ if __name__ == "__main__":
         .option("startingOffsets", "latest") \
         .load()
 
-    # Extract Kafka value (binary → string)
-    messages = df.select(col("value").cast("string").alias("weather_message"))
+    # Extract Kafka "value" as string
+    weather_df = df.selectExpr("CAST(value AS STRING) as message")
 
-    query = messages.writeStream \
+    # Write to console
+    query = weather_df.writeStream \
         .outputMode("append") \
         .format("console") \
         .option("truncate", False) \
         .start()
 
     query.awaitTermination()
+
