@@ -1,42 +1,42 @@
 """
 Weather Producer
-Reads weather readings from data.csv
-Publishes each row as a message to Kafka topic: weather.readings
+Reads weather readings from data.json
+Publishes each record as a message to Kafka topic: weather.readings
 """
 
 import time
-import pandas as pd
+import json
 from kafka import KafkaProducer
 
 TOPIC = "weather.readings"
 
 if __name__ == "__main__":
-    print("🚀 Starting Weather Producer with CSV data...")
+    print("🚀 Starting Weather Producer with JSON data...")
 
     # Initialize Kafka producer
     producer = KafkaProducer(
         bootstrap_servers="localhost:9092",
-        value_serializer=lambda v: str(v).encode("utf-8")
+        value_serializer=lambda v: json.dumps(v).encode("utf-8")
     )
 
-    # Load CSV
-    df = pd.read_csv("data.csv")
+    # Load JSON file
+    with open("data.json", "r") as f:
+        records = json.load(f)
 
-    for _, row in df.iterrows():
-        record = row.to_dict()
-        message = str(record)
-
+    for record in records:
         # Send message to Kafka
-        producer.send(TOPIC, value=message)
+        producer.send(TOPIC, value=record)
         producer.flush()
-        print(f"✅ Sent: {message}")
+        print(f"✅ Sent: {record}")
 
         time.sleep(1)  # simulate sensor interval
 
-    print("✅ Finished sending all records from CSV")
+    print("✅ Finished sending all records from JSON")
     producer.close()
 
-c9nsumer
+consumer
+
+
 """
 Weather Consumer
 Consumes weather readings from Kafka
@@ -66,7 +66,7 @@ if __name__ == "__main__":
         .option("startingOffsets", "latest") \
         .load()
 
-    # Extract Kafka "value" field
+    # Extract Kafka "value" as string
     weather_df = df.selectExpr("CAST(value AS STRING) as message")
 
     # Write to console
@@ -77,4 +77,3 @@ if __name__ == "__main__":
         .start()
 
     query.awaitTermination()
-
