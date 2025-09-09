@@ -1,47 +1,45 @@
 """
-Weather Producer
-Reads weather readings from data.json
-Publishes each record as a message to Kafka topic: weather.readings
+Weather Producer - Milestone 1
+Simulates IoT devices by sending weather data into Kafka topic: weather.readings
 """
 
-import time
 import json
+import time
+import random
 from kafka import KafkaProducer
 
 TOPIC = "weather.readings"
 
-if __name__ == "__main__":
-    print("🚀 Starting Weather Producer with JSON data...")
-
-    # Initialize Kafka producer
-    producer = KafkaProducer(
+def create_producer():
+    return KafkaProducer(
         bootstrap_servers="localhost:9092",
         value_serializer=lambda v: json.dumps(v).encode("utf-8")
     )
 
-    # Load JSON file
+if __name__ == "__main__":
+    print("🚀 Starting Weather Producer...")
+    producer = create_producer()
+
+    # Load dataset from JSON
     with open("data.json", "r") as f:
         records = json.load(f)
 
-    for record in records:
-        # Send message to Kafka
+    # Loop forever simulating continuous IoT stream
+    while True:
+        record = random.choice(records)  # pick a random sensor reading
+
+        # send to Kafka
         producer.send(TOPIC, value=record)
         producer.flush()
+
         print(f"✅ Sent: {record}")
+        time.sleep(1)  # simulate 1 reading/sec
 
-        time.sleep(1)  # simulate sensor interval
-
-    print("✅ Finished sending all records from JSON")
-    producer.close()
 
 consumer
-
-
 """
-Weather Consumer
-Consumes weather readings from Kafka
-Logs messages to console
-Uses PySpark Structured Streaming
+Weather Consumer - Milestone 1
+Consumes messages from Kafka topic: weather.readings using PySpark Structured Streaming
 """
 
 from pyspark.sql import SparkSession
@@ -49,8 +47,6 @@ from pyspark.sql import SparkSession
 TOPIC = "weather.readings"
 
 if __name__ == "__main__":
-    print("🚀 Starting Weather Consumer...")
-
     spark = SparkSession.builder \
         .appName("WeatherConsumer") \
         .master("local[*]") \
@@ -58,7 +54,7 @@ if __name__ == "__main__":
 
     spark.sparkContext.setLogLevel("WARN")
 
-    # Read from Kafka
+    # Read stream from Kafka
     df = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", "localhost:9092") \
@@ -66,11 +62,10 @@ if __name__ == "__main__":
         .option("startingOffsets", "latest") \
         .load()
 
-    # Extract Kafka "value" as string
-    weather_df = df.selectExpr("CAST(value AS STRING) as message")
+    # Convert Kafka value (binary) → string
+    messages = df.selectExpr("CAST(value AS STRING)")
 
-    # Write to console
-    query = weather_df.writeStream \
+    query = messages.writeStream \
         .outputMode("append") \
         .format("console") \
         .option("truncate", False) \
