@@ -17,46 +17,199 @@ if __name__ == "__main__":
         data = json.load(f)
 
     producer = create_producer()
-    print("🚀 Sending raw weather readings to Kafka...")
+    print("🚀 Sending weather readings to Kafka...")
 
     for record in data:
         producer.send(TOPIC, record)
         print("✅ Sent:", record)
-        time.sleep(1)
+        time.sleep(1)  # simulate real-time streaming
 
     producer.flush()
 
 consumer
-# weather_alert_consumer.py
+# weather_consumer.py
 import json
 from kafka import KafkaConsumer
 
-TOPIC = "weather.alerts"
+TOPIC = "weather.readings"
 BOOTSTRAP_SERVERS = ["localhost:9092"]
 
+# ---------------- Data Cleaning Functions ----------------
+def clean_temperature(temp):
+    if not temp:
+        return 0.0
+    try:
+        value = float(temp.split()[0])
+        unit = temp.split()[1].upper() if len(temp.split()) > 1 else "C"
+        if unit in ["F", "FAHRENHEIT"]:
+            return (value - 32) * 5.0 / 9.0  # convert F → C
+        return value
+    except Exception:
+        return 0.0
+
+def clean_humidity(h):
+    if not h:
+        return 0.0
+    try:
+        return float(h.strip().replace("%", ""))
+    except Exception:
+        return 0.0
+
+def clean_wind_speed(ws):
+    if not ws:
+        return 0.0
+    try:
+        return float(ws.strip().lower().replace("km/h", "").strip())
+    except Exception:
+        return 0.0
+
+def clean_precipitation(p):
+    if not p:
+        return 0.0
+    try:
+        return float(p.strip().lower().replace("mm/h", "").strip())
+    except Exception:
+        return 0.0
+
+def clean_pressure(pr):
+    if not pr:
+        return 1013.0  # default average sea-level pressure
+    try:
+        return float(pr.strip().lower().replace("hpa", "").strip())
+    except Exception:
+        return 1013.0
+
+def clean_record(record):
+    return {
+        "station_id": record.get("station_id", "UNKNOWN"),
+        "temperature_C": clean_temperature(record.get("temperature")),
+        "humidity_%": clean_humidity(record.get("humidity")),
+        "wind_speed_kmh": clean_wind_speed(record.get("wind_speed")),
+        "precipitation_mm": clean_precipitation(record.get("precipitation")),
+        "pressure_hpa": clean_pressure(record.get("pressure")),
+        "location": record.get("location", "UNKNOWN"),
+    }
+
+# ---------------- Kafka Consumer ----------------
 def create_consumer():
     return KafkaConsumer(
         TOPIC,
         bootstrap_servers=BOOTSTRAP_SERVERS,
         auto_offset_reset="earliest",
         enable_auto_commit=True,
-        group_id="alert-clean-consumer",
+        group_id="weather-consumer-group",
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
     )
 
 if __name__ == "__main__":
     consumer = create_consumer()
-    print("📡 Listening for emergency alerts...")
-    for msg in consumer:
-        alert = msg.value
-        print("\n🚨 EMERGENCY ALERT 🚨")
-        print(f"Station: {alert.get('station_id', 'UNKNOWN')}")
-        print(f"Location: {alert.get('location', 'UNKNOWN')}")
+    print(f"📡 Listening to {TOPIC}...")
 
-        # Defensive: check if "alerts" key exists
-        if "alerts" in alert:
-            print(f"Alerts: {', '.join(alert['alerts'])}")
-        else:
-            print("Alerts: NONE (invalid or malformed message)")
+    for message in consumer:
+        cleaned = clean_record(message.value)
+        print("\n🌦️ Cleaned Weather Reading:")
+        print(json.dumps(cleaned, indent=2))
 
-        print(f"Timestamp: {alert.get('reading_timestamp', 'N/A')}")
+
+alert coms
+# weather_alert_consumer.py
+import json
+from kafka import KafkaConsumer
+
+TOPIC = "weather.readings"
+BOOTSTRAP_SERVERS = ["localhost:9092"]
+
+# Reuse cleaning functions from weather_consumer.py
+def clean_temperature(temp):
+    if not temp:
+        return 0.0
+    try:
+        value = float(temp.split()[0])
+        unit = temp.split()[1].upper() if len(temp.split()) > 1 else "C"
+        if unit in ["F", "FAHRENHEIT"]:
+            return (value - 32) * 5.0 / 9.0
+        return value
+    except Exception:
+        return 0.0
+
+def clean_humidity(h):
+    if not h:
+        return 0.0
+    try:
+        return float(h.strip().replace("%", ""))
+    except Exception:
+        return 0.0
+
+def clean_wind_speed(ws):
+    if not ws:
+        return 0.0
+    try:
+        return float(ws.strip().lower().replace("km/h", "").strip())
+    except Exception:
+        return 0.0
+
+def clean_precipitation(p):
+    if not p:
+        return 0.0
+    try:
+        return float(p.strip().lower().replace("mm/h", "").strip())
+    except Exception:
+        return 0.0
+
+def clean_pressure(pr):
+    if not pr:
+        return 1013.0
+    try:
+        return float(pr.strip().lower().replace("hpa", "").strip())
+    except Exception:
+        return 1013.0
+
+def clean_record(record):
+    return {
+        "station_id": record.get("station_id", "UNKNOWN"),
+        "temperature_C": clean_temperature(record.get("temperature")),
+        "humidity_%": clean_humidity(record.get("humidity")),
+        "wind_speed_kmh": clean_wind_speed(record.get("wind_speed")),
+        "precipitation_mm": clean_precipitation(record.get("precipitation")),
+        "pressure_hpa": clean_pressure(record.get("pressure")),
+        "location": record.get("location", "UNKNOWN"),
+    }
+
+# ---------------- Alert Logic ----------------
+def check_alerts(record):
+    alerts = []
+
+    if record["wind_speed_kmh"] > 70:
+        alerts.append("🌪️ High Wind Alert")
+    if record["precipitation_mm"] > 30:
+        alerts.append("🌊 Flood Warning")
+    if record["wind_speed_kmh"] > 50 and record["precipitation_mm"] > 20:
+        alerts.append("⛈️ Storm Warning")
+    if record["temperature_C"] < -20 or record["temperature_C"] > 40:
+        alerts.append("🔥 Extreme Temperature")
+
+    return alerts
+
+# ---------------- Kafka Consumer ----------------
+def create_consumer():
+    return KafkaConsumer(
+        TOPIC,
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        auto_offset_reset="earliest",
+        enable_auto_commit=True,
+        group_id="weather-alert-consumer-group",
+        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+    )
+
+if __name__ == "__main__":
+    consumer = create_consumer()
+    print(f"📡 Listening for alerts from {TOPIC}...")
+
+    for message in consumer:
+        cleaned = clean_record(message.value)
+        alerts = check_alerts(cleaned)
+
+        if alerts:
+            print(f"\n🚨 ALERTS at {cleaned['location']} (Station {cleaned['station_id']}):")
+            for a in alerts:
+                print("  -", a)
