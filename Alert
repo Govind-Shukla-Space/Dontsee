@@ -1,0 +1,103 @@
+alert
+"""
+Weather Alert Producer
+Consumes messages from `weather.readings`,
+checks hazard conditions, and publishes alerts to `weather.alerts`
+"""
+
+import json
+import re
+from kafka import KafkaConsumer, KafkaProducer
+
+READINGS_TOPIC = "weather.readings"
+ALERTS_TOPIC = "weather.alerts"
+
+def parse_number(value, pattern=r"([-+]?\d*\.?\d+)"):
+    """Extract numeric value from a string like '30 km/h' or '35mm'"""
+    match = re.search(pattern, str(value))
+    return float(match.group(1)) if match else None
+
+def detect_alerts(record):
+    """Check conditions and return alert messages (if any)"""
+    alerts = []
+    temp = parse_number(record.get("temperature"))
+    humidity = parse_number(record.get("humidity"))
+    wind = parse_number(record.get("wind_speed"))
+    precip = parse_number(record.get("precipitation"))
+    pressure = parse_number(record.get("pressure"))
+
+    if wind and wind > 70:
+        alerts.append("⚠️ High Wind Alert")
+    if precip and precip > 30:
+        alerts.append("⚠️ Flood Warning")
+    if wind and precip and wind > 50 and precip > 20:
+        alerts.append("⚠️ Storm Warning")
+    if temp is not None and (temp < -20 or temp > 40):
+        alerts.append("⚠️ Extreme Temperature")
+
+    return alerts
+
+if __name__ == "__main__":
+    print("🚀 Starting Weather Alert Producer...")
+
+    consumer = KafkaConsumer(
+        READINGS_TOPIC,
+        bootstrap_servers="localhost:9092",
+        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        auto_offset_reset="latest",
+        enable_auto_commit=True
+    )
+
+    producer = KafkaProducer(
+        bootstrap_servers="localhost:9092",
+        value_serializer=lambda v: json.dumps(v).encode("utf-8")
+    )
+
+    for msg in consumer:
+        record = msg.value
+        alerts = detect_alerts(record)
+
+        if alerts:
+            for alert in alerts:
+                alert_message = {
+                    "station_id": record.get("station_id"),
+                    "location": record.get("location"),
+                    "reading_timestamp": record.get("reading_timestamp"),
+                    "alert": alert
+                }
+                producer.send(ALERTS_TOPIC, value=alert_message)
+                producer.flush()
+                print(f"🚨 ALERT PUBLISHED: {alert_message}")
+
+
+alertconsume
+"""
+Alert Consumer
+Consumes messages from `weather.alerts`
+Displays them in human-readable format
+"""
+
+import json
+from kafka import KafkaConsumer
+
+ALERTS_TOPIC = "weather.alerts"
+
+if __name__ == "__main__":
+    print("🚨 Starting Alert Consumer...")
+
+    consumer = KafkaConsumer(
+        ALERTS_TOPIC,
+        bootstrap_servers="localhost:9092",
+        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        auto_offset_reset="latest",
+        enable_auto_commit=True
+    )
+
+    for msg in consumer:
+        alert = msg.value
+        print(
+            f"[ALERT] {alert['alert']} | "
+            f"Station: {alert['station_id']} | "
+            f"Location: {alert['location']} | "
+            f"Time: {alert['reading_timestamp']}"
+        )
