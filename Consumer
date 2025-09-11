@@ -487,3 +487,95 @@ CREATE TABLE IF NOT EXISTS dim_player_stats_per_venue (
 );
 
 
+# etl/transform.py
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit, col, sum as spark_sum, count as spark_count, when
+
+# Expected schemas from your spec
+EXPECTED_SCHEMAS = {
+    "matches_info": [
+        "matchId", "seriesId", "matchName", "venueId", "startDate", "endDate",
+        "team1Score", "team2Score", "playerOfTheMatchId"
+    ],
+    "playerinfo": [
+        "playerId","teamId","playerName","born","birthPlace","height","role",
+        "battingStyle","bowlingStyle","testPlayerId","odiPlayerId","t20PlayerId"
+    ],
+    "teamdetails": ["teamId","teamName"],
+    "venuedetails": ["venueId","venueName"],
+    "odiformatstats": [
+        "playerId","odiPlayerId","matches","innings","runsScored","ballsFaced",
+        "highScore","average","strikeRate","notouts","fours","sixes","fifties",
+        "hundreds","doubleHundreds","bowlingInnings","ballsBowled","runsConceded",
+        "wickets","bowlingAverage","economy","bowlingStrikeRate","bestBowlingInInnings",
+        "bestBowlingInMatch","fiveWicketHauls","tenWicketHauls"
+    ],
+    "t20formatstats": [
+        "playerId","t20PlayerId","matches","innings","runsScored","ballsFaced",
+        "highScore","average","strikeRate","notouts","fours","sixes","fifties",
+        "hundreds","doubleHundreds","bowlingInnings","ballsBowled","runsConceded",
+        "wickets","bowlingAverage","economy","bowlingStrikeRate","bestBowlingInInnings",
+        "bestBowlingInMatch","fiveWicketHauls","tenWicketHauls"
+    ],
+    "testformatstats": [
+        "playerId","testPlayerId","matches","innings","runsScored","ballsFaced",
+        "highScore","average","strikeRate","notouts","fours","sixes","fifties",
+        "hundreds","doubleHundreds","bowlingInnings","ballsBowled","runsConceded",
+        "wickets","bowlingAverage","economy","bowlingStrikeRate","bestBowlingInInnings",
+        "bestBowlingInMatch","fiveWicketHauls","tenWicketHauls"
+    ],
+    "playerstatspervenue": ["playerId","venueId","matches","runsScored","wickets"],
+    "sample_t20_match": [
+        "match_id","inning","over","ball","batting_team_id","bowling_team_id",
+        "striker_id","non_striker_id","bowler_id","ball_speed","runs_batsman",
+        "runs_extras","extras_type","wicket.is_wicket","wicket.kind",
+        "wicket.player_out_id","wicket.fielder_id"
+    ]
+}
+
+def safe_select(df: DataFrame, expected: list) -> DataFrame:
+    present = [c for c in expected if c in df.columns]
+    missing = [c for c in expected if c not in df.columns]
+    if missing:
+        print(f"[WARN] Missing columns: {missing}")
+    return df.select(*present)
+
+def transform_matches_info(df: DataFrame) -> DataFrame:
+    return safe_select(df, EXPECTED_SCHEMAS["matches_info"])
+
+def transform_playerinfo(df: DataFrame) -> DataFrame:
+    return safe_select(df, EXPECTED_SCHEMAS["playerinfo"])
+
+def transform_teamdetails(df: DataFrame) -> DataFrame:
+    return safe_select(df, EXPECTED_SCHEMAS["teamdetails"])
+
+def transform_venuedetails(df: DataFrame) -> DataFrame:
+    return safe_select(df, EXPECTED_SCHEMAS["venuedetails"])
+
+def transform_formatstats(df: DataFrame, fmt: str) -> DataFrame:
+    # rename playerId if missing
+    if "playerId" not in df.columns:
+        for alt in ["odiPlayerId","t20PlayerId","testPlayerId"]:
+            if alt in df.columns:
+                df = df.withColumnRenamed(alt, "playerId")
+    df = safe_select(df, EXPECTED_SCHEMAS[f"{fmt.lower()}formatstats"])
+    return df.withColumn("formatType", lit(fmt.upper()))
+
+def transform_sample_t20_match_to_fact_ballbyball(df: DataFrame) -> DataFrame:
+    # flatten nested fields
+    renames = {
+        "wicket.is_wicket": "is_wicket",
+        "wicket.kind": "wicket_kind",
+        "wicket.player_out_id": "wicket_player_out_id",
+        "wicket.fielder_id": "wicket_fielder_id"
+    }
+    for old, new in renames.items():
+        if old in df.columns:
+            df = df.withColumnRenamed(old, new)
+    return safe_select(df, [
+        "match_id","inning","over","ball","batting_team_id","bowling_team_id",
+        "striker_id","non_striker_id","bowler_id","ball_speed","runs_batsman",
+        "runs_extras","extras_type","is_wicket","wicket_kind",
+        "wicket_player_out_id","wicket_fielder_id"
+    ])
+
