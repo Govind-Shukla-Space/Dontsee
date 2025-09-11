@@ -1,85 +1,271 @@
-# weather_alert_producer_clean.py
-import json
-from kafka import KafkaConsumer, KafkaProducer
-from weather_consumer_clean import process_record
+# etl/transform.py
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit, col, sum as spark_sum, count as spark_count, when
 
-READINGS_TOPIC = "weather.readings"
-ALERTS_TOPIC = "weather.alerts"
-BOOTSTRAP_SERVERS = ["localhost:9092"]
+# --- DIMENSIONS ---
 
-def create_consumer():
-    return KafkaConsumer(
-        READINGS_TOPIC,
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        auto_offset_reset="earliest",
-        enable_auto_commit=True,
-        group_id="alert-clean-producer",
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+def transform_matches_info(df: DataFrame) -> DataFrame:
+    return df.select(
+        col("matchId"),
+        col("seriesId"),
+        col("matchName"),
+        col("venueId"),
+        col("startDate"),
+        col("endDate"),
+        col("team1Score"),
+        col("team2Score"),
+        col("playerOfTheMatchId")
     )
 
-def create_producer():
-    return KafkaProducer(
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+def transform_playerinfo(df: DataFrame) -> DataFrame:
+    return df.select(
+        col("playerId"),
+        col("teamId"),
+        col("playerName"),
+        col("born"),
+        col("birthPlace"),
+        col("height"),
+        col("role"),
+        col("battingStyle"),
+        col("bowlingStyle"),
+        col("testPlayerId"),
+        col("odiPlayerId"),
+        col("t20PlayerId")
     )
 
-def check_alerts(record):
-    alerts = []
-    if record["wind_speed_kmh"] > 70:
-        alerts.append("High Wind Alert")
-    if record["precip_mm"] > 30:
-        alerts.append("Flood Warning")
-    if record["wind_speed_kmh"] > 50 and record["precip_mm"] > 20:
-        alerts.append("Storm Warning")
-    if record["temperature_c"] < -20 or record["temperature_c"] > 40:
-        alerts.append("Extreme Temperature")
-    return alerts
+def transform_teamdetails(df: DataFrame) -> DataFrame:
+    return df.select(col("teamId"), col("teamName"))
 
-if __name__ == "__main__":
-    consumer = create_consumer()
-    producer = create_producer()
-    print("⚡ Processing cleaned weather data & generating alerts...")
+def transform_venuedetails(df: DataFrame) -> DataFrame:
+    return df.select(col("venueId"), col("venueName"))
 
-    for msg in consumer:
-        cleaned = process_record(msg.value)
-        alerts = check_alerts(cleaned)
-        if alerts:
-            alert_msg = {
-                "station_id": cleaned["station_id"],
-                "location": cleaned["location"],
-                "alerts": alerts,
-                "reading_timestamp": cleaned["reading_timestamp"],
-            }
-            producer.send(ALERTS_TOPIC, alert_msg)
-            print("🚨 ALERT Published:", alert_msg)
+def transform_formatstats(df: DataFrame, fmt: str) -> DataFrame:
+    # unify playerId
+    for alt in ["playerId", "odiPlayerId", "t20PlayerId", "testPlayerId"]:
+        if alt in df.columns and alt != "playerId":
+            df = df.withColumnRenamed(alt, "playerId")
+    return df.select(
+        col("playerId"), col("matches"), col("innings"), col("runsScored"),
+        col("ballsFaced"), col("highScore"), col("average"), col("strikeRate"),
+        col("notouts"), col("fours"), col("sixes"), col("fifties"),
+        col("hundreds"), col("doubleHundreds"),
+        col("bowlingInnings"), col("ballsBowled"), col("runsConceded"),
+        col("wickets"), col("bowlingAverage"), col("economy"),
+        col("bowlingStrikeRate"), col("bestBowlingInInnings"),
+        col("bestBowlingInMatch"), col("fiveWicketHauls"), col("tenWicketHauls")
+    ).withColumn("formatType", lit(fmt.upper()))
 
-
-consumer
-
-# weather_alert_consumer.py
-import json
-from kafka import KafkaConsumer
-
-TOPIC = "weather.alerts"
-BOOTSTRAP_SERVERS = ["localhost:9092"]
-
-def create_consumer():
-    return KafkaConsumer(
-        TOPIC,
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        auto_offset_reset="earliest",
-        enable_auto_commit=True,
-        group_id="alert-clean-consumer",
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+def transform_playerstatspervenue(df: DataFrame) -> DataFrame:
+    return df.select(
+        col("playerId"),
+        col("venueId"),
+        col("matches"),
+        col("runsScored"),
+        col("wickets")
     )
 
-if __name__ == "__main__":
-    consumer = create_consumer()
-    print("📡 Listening for emergency alerts...")
-    for msg in consumer:
-        alert = msg.value
-        print("\n🚨 EMERGENCY ALERT 🚨")
-        print(f"Station: {alert['station_id']}")
-        print(f"Location: {alert['location']}")
-        print(f"Alerts: {', '.join(alert['alerts'])}")
-        print(f"Timestamp: {alert['reading_timestamp']}")
+# --- FACTS ---
+
+def transform_sample_t20_match_to_fact_ballbyball(df: DataFrame) -> DataFrame:
+    # flatten nested columns
+    renames = {
+        "wicket.is_wicket": "is_wicket",
+        "wicket.kind": "wicketKind",
+        "wicket.player_out_id": "wicketPlayerOutId",
+        "wicket.fielder_id": "wicketFielderId"
+    }
+    for old, new in renames.items():
+        if old in df.columns:
+            df = df.withColumnRenamed(old, new)
+    return df.select(
+        col("match_id").alias("matchId"),
+        col("inning"),
+        col("over"),
+        col("ball"),
+        col("batting_team_id").alias("battingTeamId"),
+        col("bowling_team_id").alias("bowlingTeamId"),
+        col("striker_id").alias("strikerId"),
+        col("non_striker_id").alias("nonStrikerId"),
+        col("bowler_id").alias("bowlerId"),
+        col("ball_speed").alias("ballSpeed"),
+        col("runs_batsman").alias("runsBatsman"),
+        col("runs_extras").alias("runsExtras"),
+        col("extras_type").alias("extrasType"),
+        col("is_wicket"),
+        col("wicketKind"),
+        col("wicketPlayerOutId"),
+        col("wicketFielderId")
+    )
+
+def build_player_match_stats_from_ballbyball(ball_df: DataFrame) -> DataFrame:
+    # Batsman side
+    batsman_agg = (
+        ball_df.groupBy("matchId", "strikerId")
+        .agg(
+            spark_sum("runsBatsman").alias("runsScored"),
+            spark_count(when(col("runsBatsman") >= 0, True)).alias("ballsFaced")
+        )
+        .withColumnRenamed("strikerId", "playerId")
+    )
+
+    # Bowler side
+    bowler_agg = (
+        ball_df.groupBy("matchId", "bowlerId")
+        .agg(
+            spark_sum("runsBatsman").alias("runsConceded"),
+            spark_sum(when(col("is_wicket") == 1, 1).otherwise(0)).alias("wickets"),
+            spark_count(when(col("bowlerId").isNotNull(), True)).alias("ballsBowled")
+        )
+        .withColumnRenamed("bowlerId", "playerId")
+    )
+
+    # Merge both
+    combined = batsman_agg.join(bowler_agg, on=["matchId", "playerId"], how="fullouter")
+    combined = combined.na.fill(0, subset=["runsScored","ballsFaced","runsConceded","wickets","ballsBowled"])
+    combined = combined.withColumn("strikeRate", when(col("ballsFaced") > 0, (col("runsScored")*100.0)/col("ballsFaced")).otherwise(0))
+    combined = combined.withColumn("oversBowled", when(col("ballsBowled") > 0, col("ballsBowled")/6.0).otherwise(0))
+    combined = combined.withColumn("economy", when(col("oversBowled") > 0, col("runsConceded")/col("oversBowled")).otherwise(0))
+    return combined
+
+-- ========================
+-- DIMENSIONS
+-- ========================
+
+DROP TABLE IF EXISTS dim_player;
+CREATE TABLE dim_player (
+    playerId INT PRIMARY KEY,
+    teamId INT,
+    playerName VARCHAR(255),
+    born DATE,
+    birthPlace VARCHAR(255),
+    height VARCHAR(20),
+    role VARCHAR(50),
+    battingStyle VARCHAR(50),
+    bowlingStyle VARCHAR(50),
+    testPlayerId INT,
+    odiPlayerId INT,
+    t20PlayerId INT,
+    FOREIGN KEY (teamId) REFERENCES dim_team(teamId)
+);
+
+DROP TABLE IF EXISTS dim_team;
+CREATE TABLE dim_team (
+    teamId INT PRIMARY KEY,
+    teamName VARCHAR(255)
+);
+
+DROP TABLE IF EXISTS dim_venue;
+CREATE TABLE dim_venue (
+    venueId INT PRIMARY KEY,
+    venueName VARCHAR(255)
+);
+
+DROP TABLE IF EXISTS dim_match;
+CREATE TABLE dim_match (
+    matchId INT PRIMARY KEY,
+    seriesId INT,
+    matchName VARCHAR(255),
+    venueId INT,
+    startDate DATE,
+    endDate DATE,
+    team1Score INT,
+    team2Score INT,
+    playerOfTheMatchId INT,
+    FOREIGN KEY (venueId) REFERENCES dim_venue(venueId),
+    FOREIGN KEY (playerOfTheMatchId) REFERENCES dim_player(playerId)
+);
+
+DROP TABLE IF EXISTS dim_format_stats;
+CREATE TABLE dim_format_stats (
+    playerId INT,
+    matches INT,
+    innings INT,
+    runsScored INT,
+    ballsFaced INT,
+    highScore INT,
+    average FLOAT,
+    strikeRate FLOAT,
+    notouts INT,
+    fours INT,
+    sixes INT,
+    fifties INT,
+    hundreds INT,
+    doubleHundreds INT,
+    bowlingInnings INT,
+    ballsBowled INT,
+    runsConceded INT,
+    wickets INT,
+    bowlingAverage FLOAT,
+    economy FLOAT,
+    bowlingStrikeRate FLOAT,
+    bestBowlingInInnings VARCHAR(20),
+    bestBowlingInMatch VARCHAR(20),
+    fiveWicketHauls INT,
+    tenWicketHauls INT,
+    formatType VARCHAR(10),
+    FOREIGN KEY (playerId) REFERENCES dim_player(playerId)
+);
+
+DROP TABLE IF EXISTS dim_player_stats_per_venue;
+CREATE TABLE dim_player_stats_per_venue (
+    playerId INT,
+    venueId INT,
+    matches INT,
+    runsScored INT,
+    wickets INT,
+    PRIMARY KEY (playerId, venueId),
+    FOREIGN KEY (playerId) REFERENCES dim_player(playerId),
+    FOREIGN KEY (venueId) REFERENCES dim_venue(venueId)
+);
+
+-- ========================
+-- FACTS
+-- ========================
+
+DROP TABLE IF EXISTS fact_ballbyball;
+CREATE TABLE fact_ballbyball (
+    matchId INT,
+    inning INT,
+    over INT,
+    ball INT,
+    battingTeamId INT,
+    bowlingTeamId INT,
+    strikerId INT,
+    nonStrikerId INT,
+    bowlerId INT,
+    ballSpeed FLOAT,
+    runsBatsman INT,
+    runsExtras INT,
+    extrasType VARCHAR(50),
+    is_wicket TINYINT,
+    wicketKind VARCHAR(50),
+    wicketPlayerOutId INT,
+    wicketFielderId INT,
+    PRIMARY KEY (matchId, inning, over, ball),
+    FOREIGN KEY (matchId) REFERENCES dim_match(matchId),
+    FOREIGN KEY (battingTeamId) REFERENCES dim_team(teamId),
+    FOREIGN KEY (bowlingTeamId) REFERENCES dim_team(teamId),
+    FOREIGN KEY (strikerId) REFERENCES dim_player(playerId),
+    FOREIGN KEY (nonStrikerId) REFERENCES dim_player(playerId),
+    FOREIGN KEY (bowlerId) REFERENCES dim_player(playerId),
+    FOREIGN KEY (wicketPlayerOutId) REFERENCES dim_player(playerId),
+    FOREIGN KEY (wicketFielderId) REFERENCES dim_player(playerId)
+);
+
+DROP TABLE IF EXISTS fact_player_match_stats;
+CREATE TABLE fact_player_match_stats (
+    matchId INT,
+    playerId INT,
+    runsScored INT,
+    ballsFaced INT,
+    runsConceded INT,
+    wickets INT,
+    ballsBowled INT,
+    strikeRate FLOAT,
+    oversBowled FLOAT,
+    economy FLOAT,
+    PRIMARY KEY (matchId, playerId),
+    FOREIGN KEY (matchId) REFERENCES dim_match(matchId),
+    FOREIGN KEY (playerId) REFERENCES dim_player(playerId)
+);
+
