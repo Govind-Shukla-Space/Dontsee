@@ -1,215 +1,489 @@
-# weather_producer.py
-import json
-import time
-from kafka import KafkaProducer
+# config/db_config.py
 
-TOPIC = "weather.readings"
-BOOTSTRAP_SERVERS = ["localhost:9092"]
+DB_CONFIG = {
+    "source_url": "jdbc:mysql://localhost:3306/cricket",
+    "target_url": "jdbc:mysql://localhost:3306/cricket_verified",
+    "user": "root",
+    "password": "yourpassword",
+    "driver": "com.mysql.cj.jdbc.Driver",
+    # JDBC driver jar path (set in jobs/etl_job.py SparkSession config)
+    "jdbc_jar": "/path/to/mysql-connector-java-8.0.x.jar"
+}
 
-def create_producer():
-    return KafkaProducer(
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+# etl/utils.py
+from pyspark.sql.functions import col
+from pyspark.sql import DataFrame
+
+def cast_columns(df: DataFrame, casts: dict):
+    """
+    casts: { "colname": "type", ... } e.g. {"runsScored": "int", "strikeRate": "double"}
+    returns DataFrame with casted columns (if column exists)
+    """
+    for c, t in casts.items():
+        if c in df.columns:
+            df = df.withColumn(c, col(c).cast(t))
+    return df
+
+def fill_nulls(df: DataFrame, fill_map: dict):
+    """
+    fill_map: { "col": default_value, ... }
+    """
+    existing = {k: v for k, v in fill_map.items() if k in df.columns}
+    if existing:
+        df = df.fillna(existing)
+    return df
+
+def enforce_non_negative(df: DataFrame, cols: list):
+    for c in cols:
+        if c in df.columns:
+            df = df.withColumn(c, col(c).cast("double"))
+            # Negative values set to NULL (will be replaced later)
+            df = df.withColumn(c, 
+                (col(c)).when(col(c) >= 0, col(c)).otherwise(None)
+            )
+    return df
+
+# etl/extract.py
+from pyspark.sql import SparkSession
+from config.db_config import DB_CONFIG
+
+def extract_table(spark: SparkSession, table_name: str):
+    df = (
+        spark.read.format("jdbc")
+        .option("url", DB_CONFIG["source_url"])
+        .option("dbtable", table_name)
+        .option("user", DB_CONFIG["user"])
+        .option("password", DB_CONFIG["password"])
+        .option("driver", DB_CONFIG["driver"])
+        .load()
     )
+    return df
+# etl/validate.py
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col, lit, to_date, regexp_replace
+from etl.utils import cast_columns, fill_nulls, enforce_non_negative
 
-if __name__ == "__main__":
-    with open("data.json") as f:
-        data = json.load(f)
-
-    producer = create_producer()
-    print("🚀 Sending weather readings to Kafka...")
-
-    for record in data:
-        producer.send(TOPIC, record)
-        print("✅ Sent:", record)
-        time.sleep(1)  # simulate real-time streaming
-
-    producer.flush()
-
-consumer
-# weather_consumer.py
-import json
-from kafka import KafkaConsumer
-
-TOPIC = "weather.readings"
-BOOTSTRAP_SERVERS = ["localhost:9092"]
-
-# ---------------- Data Cleaning Functions ----------------
-def clean_temperature(temp):
-    if not temp:
-        return 0.0
-    try:
-        value = float(temp.split()[0])
-        unit = temp.split()[1].upper() if len(temp.split()) > 1 else "C"
-        if unit in ["F", "FAHRENHEIT"]:
-            return (value - 32) * 5.0 / 9.0  # convert F → C
-        return value
-    except Exception:
-        return 0.0
-
-def clean_humidity(h):
-    if not h:
-        return 0.0
-    try:
-        return float(h.strip().replace("%", ""))
-    except Exception:
-        return 0.0
-
-def clean_wind_speed(ws):
-    if not ws:
-        return 0.0
-    try:
-        return float(ws.strip().lower().replace("km/h", "").strip())
-    except Exception:
-        return 0.0
-
-def clean_precipitation(p):
-    if not p:
-        return 0.0
-    try:
-        return float(p.strip().lower().replace("mm/h", "").strip())
-    except Exception:
-        return 0.0
-
-def clean_pressure(pr):
-    if not pr:
-        return 1013.0  # default average sea-level pressure
-    try:
-        return float(pr.strip().lower().replace("hpa", "").strip())
-    except Exception:
-        return 1013.0
-
-def clean_record(record):
-    return {
-        "station_id": record.get("station_id", "UNKNOWN"),
-        "temperature_C": clean_temperature(record.get("temperature")),
-        "humidity_%": clean_humidity(record.get("humidity")),
-        "wind_speed_kmh": clean_wind_speed(record.get("wind_speed")),
-        "precipitation_mm": clean_precipitation(record.get("precipitation")),
-        "pressure_hpa": clean_pressure(record.get("pressure")),
-        "location": record.get("location", "UNKNOWN"),
+def validate_matches_info(df: DataFrame):
+    # expected columns: matchId, seriesId, matchName, venueId, startDate, endDate, team1Score, team2Score, playerOfTheMatchId
+    casts = {
+        "matchId": "string", "seriesId": "string",
+        "venueId": "string", "team1Score": "int", "team2Score": "int", "playerOfTheMatchId": "string"
     }
+    df = cast_columns(df, casts)
+    # normalize dates
+    if "startDate" in df.columns:
+        df = df.withColumn("startDate", to_date(col("startDate"), "yyyy-MM-dd"))
+    if "endDate" in df.columns:
+        df = df.withColumn("endDate", to_date(col("endDate"), "yyyy-MM-dd"))
+    # dedupe
+    df = df.dropDuplicates(["matchId"])
+    # fill null textual fields
+    df = fill_nulls(df, {"matchName": "Unknown Match"})
+    # ensure non-negative scores
+    df = enforce_non_negative(df, ["team1Score", "team2Score"])
+    return df
 
-# ---------------- Kafka Consumer ----------------
-def create_consumer():
-    return KafkaConsumer(
-        TOPIC,
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        auto_offset_reset="earliest",
-        enable_auto_commit=True,
-        group_id="weather-consumer-group",
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-    )
+def validate_playerinfo(df: DataFrame):
+    casts = {"playerId": "string", "teamId": "string", "height": "double"}
+    df = cast_columns(df, casts)
+    df = fill_nulls(df, {"playerName": "Unknown", "role": "Unknown", "battingStyle": "Unknown", "bowlingStyle": "Unknown"})
+    # dedupe
+    df = df.dropDuplicates(["playerId"])
+    return df
 
-if __name__ == "__main__":
-    consumer = create_consumer()
-    print(f"📡 Listening to {TOPIC}...")
+def validate_format_stats(df: DataFrame, table_name: str):
+    # common numeric casts for format stats
+    casts = {}
+    numeric_cols = [
+        "matches","innings","runsScored","ballsFaced","highScore","average","strikeRate","notouts",
+        "fours","sixes","fifties","hundreds","doubleHundreds",
+        "ballsBowled","runsConceded","wickets","bowlingAverage","economy","bowlingStrikeRate",
+        "fiveWicketHauls","tenWicketHauls"
+    ]
+    for c in numeric_cols:
+        casts[c] = "double"
+    # player id column names might vary, so just cast any present id columns
+    for possible_id in ["playerId","odiPlayerId","t20PlayerId","testPlayerId"]:
+        casts[possible_id] = "string"
+    df = cast_columns(df, casts)
+    # fill null numeric to 0
+    fill_map = {c: 0 for c in numeric_cols if c in df.columns}
+    df = fill_nulls(df, fill_map)
+    # dedupe by playerId (if present) else entire row
+    if "playerId" in df.columns:
+        df = df.dropDuplicates(["playerId"])
+    else:
+        df = df.dropDuplicates()
+    return df
 
-    for message in consumer:
-        cleaned = clean_record(message.value)
-        print("\n🌦️ Cleaned Weather Reading:")
-        print(json.dumps(cleaned, indent=2))
+def validate_teamdetails(df: DataFrame):
+    df = cast_columns(df, {"teamId": "string"})
+    df = fill_nulls(df, {"teamName": "Unknown Team"})
+    df = df.dropDuplicates(["teamId"])
+    return df
 
+def validate_venuedetails(df: DataFrame):
+    df = cast_columns(df, {"venueId": "string"})
+    df = fill_nulls(df, {"venueName": "Unknown Venue"})
+    df = df.dropDuplicates(["venueId"])
+    return df
 
-alert coms
-# weather_alert_consumer.py
-import json
-from kafka import KafkaConsumer
-
-TOPIC = "weather.readings"
-BOOTSTRAP_SERVERS = ["localhost:9092"]
-
-# Reuse cleaning functions from weather_consumer.py
-def clean_temperature(temp):
-    if not temp:
-        return 0.0
-    try:
-        value = float(temp.split()[0])
-        unit = temp.split()[1].upper() if len(temp.split()) > 1 else "C"
-        if unit in ["F", "FAHRENHEIT"]:
-            return (value - 32) * 5.0 / 9.0
-        return value
-    except Exception:
-        return 0.0
-
-def clean_humidity(h):
-    if not h:
-        return 0.0
-    try:
-        return float(h.strip().replace("%", ""))
-    except Exception:
-        return 0.0
-
-def clean_wind_speed(ws):
-    if not ws:
-        return 0.0
-    try:
-        return float(ws.strip().lower().replace("km/h", "").strip())
-    except Exception:
-        return 0.0
-
-def clean_precipitation(p):
-    if not p:
-        return 0.0
-    try:
-        return float(p.strip().lower().replace("mm/h", "").strip())
-    except Exception:
-        return 0.0
-
-def clean_pressure(pr):
-    if not pr:
-        return 1013.0
-    try:
-        return float(pr.strip().lower().replace("hpa", "").strip())
-    except Exception:
-        return 1013.0
-
-def clean_record(record):
-    return {
-        "station_id": record.get("station_id", "UNKNOWN"),
-        "temperature_C": clean_temperature(record.get("temperature")),
-        "humidity_%": clean_humidity(record.get("humidity")),
-        "wind_speed_kmh": clean_wind_speed(record.get("wind_speed")),
-        "precipitation_mm": clean_precipitation(record.get("precipitation")),
-        "pressure_hpa": clean_pressure(record.get("pressure")),
-        "location": record.get("location", "UNKNOWN"),
+def validate_sample_t20_match(df: DataFrame):
+    # expected columns:
+    # match_id, inning, over, ball, batting_team_id, bowling_team_id, striker_id, non_striker_id, bowler_id,
+    # ball_speed, runs_batsman, runs_extras, extras_type, wicket.is_wicket, wicket.kind, wicket.player_out_id, wicket.fielder_id
+    # flatten nested wicket.* if needed
+    # rename nested wicket columns if present (e.g., "wicket.is_wicket")
+    rename_map = {}
+    for c in df.columns:
+        if "." in c:
+            rename_map[c] = c.replace(".", "_")
+    for src, dst in rename_map.items():
+        df = df.withColumnRenamed(src, dst)
+    casts = {
+        "match_id": "string", "inning": "int", "over": "int", "ball": "int",
+        "batting_team_id": "string", "bowling_team_id": "string",
+        "striker_id": "string", "non_striker_id": "string", "bowler_id": "string",
+        "ball_speed": "double", "runs_batsman": "int", "runs_extras": "int",
+        "wicket_is_wicket": "int"
     }
+    df = cast_columns(df, casts)
+    # normalize extras_type
+    if "extras_type" in df.columns:
+        df = df.withColumn("extras_type", col("extras_type").cast("string"))
+    # dedupe at ball-level: unique key = match_id + inning + over + ball
+    dedupe_cols = ["match_id", "inning", "over", "ball"]
+    present = [c for c in dedupe_cols if c in df.columns]
+    if present == dedupe_cols:
+        df = df.dropDuplicates(dedupe_cols)
+    else:
+        df = df.dropDuplicates()
+    # fill missing numeric with 0
+    df = fill_nulls(df, {"runs_batsman": 0, "runs_extras": 0, "ball_speed": 0, "wicket_is_wicket": 0})
+    return df
+# etl/transform.py
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit, col, concat_ws, sum as spark_sum, count as spark_count, when
+from pyspark.sql.window import Window
 
-# ---------------- Alert Logic ----------------
-def check_alerts(record):
-    alerts = []
+def transform_matches_info(df: DataFrame) -> DataFrame:
+    # selected columns for Dim_Match & Fact_MatchSummary (we keep same table name)
+    cols = ["matchId", "seriesId", "matchName", "venueId", "startDate", "endDate", "team1Score", "team2Score", "playerOfTheMatchId"]
+    present = [c for c in cols if c in df.columns]
+    return df.select(*present)
 
-    if record["wind_speed_kmh"] > 70:
-        alerts.append("🌪️ High Wind Alert")
-    if record["precipitation_mm"] > 30:
-        alerts.append("🌊 Flood Warning")
-    if record["wind_speed_kmh"] > 50 and record["precipitation_mm"] > 20:
-        alerts.append("⛈️ Storm Warning")
-    if record["temperature_C"] < -20 or record["temperature_C"] > 40:
-        alerts.append("🔥 Extreme Temperature")
+def transform_playerinfo(df: DataFrame) -> DataFrame:
+    cols = ["playerId","teamId","playerName","born","birthPlace","height","role","battingStyle","bowlingStyle","testPlayerId","odiPlayerId","t20PlayerId"]
+    present = [c for c in cols if c in df.columns]
+    return df.select(*present)
 
-    return alerts
+def transform_teamdetails(df: DataFrame) -> DataFrame:
+    present = [c for c in ["teamId","teamName"] if c in df.columns]
+    return df.select(*present)
 
-# ---------------- Kafka Consumer ----------------
-def create_consumer():
-    return KafkaConsumer(
-        TOPIC,
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        auto_offset_reset="earliest",
-        enable_auto_commit=True,
-        group_id="weather-alert-consumer-group",
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+def transform_venuedetails(df: DataFrame) -> DataFrame:
+    present = [c for c in ["venueId","venueName"] if c in df.columns]
+    return df.select(*present)
+
+def transform_formatstats(df: DataFrame, format_label: str) -> DataFrame:
+    # add 'formatType' column to unify ODI/T20/Test stats
+    df = df.withColumn("formatType", lit(format_label))
+    # normalize playerId column name; prefer 'playerId' if present else map relevant id
+    if "playerId" not in df.columns:
+        for alt in ["odiPlayerId","t20PlayerId","testPlayerId"]:
+            if alt in df.columns:
+                df = df.withColumnRenamed(alt, "playerId")
+                break
+    # select common set
+    cols = [c for c in df.columns if c in [
+        "playerId","matches","innings","runsScored","ballsFaced","highScore","average","strikeRate","notouts",
+        "fours","sixes","fifties","hundreds","doubleHundreds","ballsBowled","runsConceded","wickets",
+        "bowlingAverage","economy","bowlingStrikeRate","bestBowlingInInnings","bestBowlingInMatch",
+        "fiveWicketHauls","tenWicketHauls","formatType"
+    ]]
+    return df.select(*cols)
+
+def transform_sample_t20_match_to_fact_ballbyball(df: DataFrame) -> DataFrame:
+    # Rename wicket_is_wicket to is_wicket for clarity if present
+    if "wicket_is_wicket" in df.columns:
+        df = df.withColumnRenamed("wicket_is_wicket","is_wicket")
+    # unify column names if necessary
+    selected = [c for c in [
+        "match_id","inning","over","ball","batting_team_id","bowling_team_id","striker_id","non_striker_id","bowler_id",
+        "ball_speed","runs_batsman","runs_extras","extras_type","is_wicket","wicket_kind","wicket_player_out_id","wicket_fielder_id"
+    ] if c in df.columns]
+    # keep as fact_ballbyball
+    return df.select(*selected)
+
+def build_player_match_stats_from_ballbyball(ball_df: DataFrame) -> DataFrame:
+    # Aggregations per player per match: runs, balls faced, fours, sixes, wickets, overs bowled, runs conceded
+    # Note: input must have match_id, striker_id, bowler_id, runs_batsman, runs_extras, is_wicket
+    # Batsman aggregations
+    batsman_agg = (
+        ball_df.groupBy("match_id", "striker_id")
+        .agg(
+            spark_sum("runs_batsman").alias("runsScored"),
+            spark_count(when(col("runs_batsman") >= 0, True)).alias("ballsFaced")
+        )
+        .withColumnRenamed("striker_id", "playerId")
+        .withColumnRenamed("match_id", "matchId")
+    )
+    # Bowler aggregations
+    bowler_agg = (
+        ball_df.groupBy("match_id", "bowler_id")
+        .agg(
+            spark_sum("runs_batsman").alias("runsConceded"),  # crude: count runs conceded by bowler as runs_batsman + runs_extras could be improved
+            spark_sum(when(col("is_wicket") == 1, 1).otherwise(0)).alias("wickets"),
+            spark_count(when(col("bowler_id").isNotNull(), True)).alias("ballsBowled")
+        )
+        .withColumnRenamed("bowler_id", "playerId")
+        .withColumnRenamed("match_id", "matchId")
+    )
+    # Join batsman and bowler stats into player match stats (union-style)
+    # We'll union and then aggregate by matchId+playerId
+    batsman_sel = batsman_agg.select("matchId","playerId","runsScored","ballsFaced")
+    bowler_sel = bowler_agg.select("matchId","playerId","runsConceded","wickets","ballsBowled")
+    combined = batsman_sel.join(bowler_sel, on=["matchId","playerId"], how="fullouter")
+    # fill nulls
+    combined = combined.na.fill(0, subset=["runsScored","ballsFaced","runsConceded","wickets","ballsBowled"])
+    # compute strikeRate and economy where possible
+    combined = combined.withColumn("strikeRate", when(col("ballsFaced") > 0, (col("runsScored")*100.0)/col("ballsFaced")).otherwise(0))
+    combined = combined.withColumn("oversBowled", when(col("ballsBowled") > 0, (col("ballsBowled")/6.0)).otherwise(0))
+    combined = combined.withColumn("economy", when(col("oversBowled") > 0, col("runsConceded")/col("oversBowled")).otherwise(0))
+    return combined
+
+def transform_all_for_target(table_name: str, df: DataFrame):
+    """
+    Dispatcher that returns (target_table_name, transformed_df)
+    target table names correspond to cricket_verified tables
+    """
+    if table_name == "matches_info":
+        return ("dim_match", transform_matches_info(df))
+    if table_name == "playerinfo":
+        return ("dim_player", transform_playerinfo(df))
+    if table_name == "teamdetails":
+        return ("dim_team", transform_teamdetails(df))
+    if table_name == "venuedetails":
+        return ("dim_venue", transform_venuedetails(df))
+    if table_name == "odiformatstats":
+        return ("dim_format_stats", transform_formatstats(df, "ODI"))
+    if table_name == "t20formatstats":
+        return ("dim_format_stats", transform_formatstats(df, "T20"))
+    if table_name == "testformatstats":
+        return ("dim_format_stats", transform_formatstats(df, "TEST"))
+    if table_name == "sample_t20_match":
+        # produce fact_ballbyball and fact_player_match_stats
+        fact_balls = transform_sample_t20_match_to_fact_ballbyball(df)
+        player_stats = build_player_match_stats_from_ballbyball(fact_balls)
+        return [("fact_ballbyball", fact_balls), ("fact_player_match_stats", player_stats)]
+    if table_name == "playerstatspervenue":
+        # pass through as is, but rename for target
+        return ("dim_player_stats_per_venue", df)
+    # fallback: return raw
+    return (table_name, df)
+# etl/load.py
+from config.db_config import DB_CONFIG
+
+def write_df_to_jdbc(df, table_name, mode="overwrite"):
+    """
+    Writes DataFrame to target_url (cricket_verified).
+    mode: "overwrite" or "append"
+    """
+    (
+        df.write.format("jdbc")
+        .option("url", DB_CONFIG["target_url"])
+        .option("dbtable", table_name)
+        .option("user", DB_CONFIG["user"])
+        .option("password", DB_CONFIG["password"])
+        .option("driver", DB_CONFIG["driver"])
+        .mode(mode)
+        .save()
     )
 
+# jobs/etl_job.py
+import sys
+from pyspark.sql import SparkSession
+from config.db_config import DB_CONFIG
+from etl.extract import extract_table
+from etl.validate import (
+    validate_matches_info, validate_playerinfo, validate_format_stats,
+    validate_teamdetails, validate_venuedetails, validate_sample_t20_match
+)
+from etl.transform import transform_all_for_target
+from etl.load import write_df_to_jdbc
+
+def run_etl():
+    spark = (
+        SparkSession.builder
+        .appName("CricketETL")
+        .config("spark.jars", DB_CONFIG["jdbc_jar"])
+        .getOrCreate()
+    )
+
+    # list of source tables to process in order
+    source_tables = [
+        "teamdetails", "venuedetails", "playerinfo", "matches_info",
+        "odiformatstats", "t20formatstats", "testformatstats",
+        "playerstatspervenue", "sample_t20_match"
+    ]
+
+    for table in source_tables:
+        print(f"==== Processing source table: {table} ====")
+        raw_df = extract_table(spark, table)
+        # validate based on table
+        if table == "matches_info":
+            clean_df = validate_matches_info(raw_df)
+        elif table == "playerinfo":
+            clean_df = validate_playerinfo(raw_df)
+        elif table in ["odiformatstats", "t20formatstats", "testformatstats"]:
+            clean_df = validate_format_stats(raw_df, table)
+        elif table == "teamdetails":
+            clean_df = validate_teamdetails(raw_df)
+        elif table == "venuedetails":
+            clean_df = validate_venuedetails(raw_df)
+        elif table == "sample_t20_match":
+            clean_df = validate_sample_t20_match(raw_df)
+        else:
+            # generic cleaning for playerstatspervenue etc.
+            clean_df = raw_df.dropDuplicates()
+
+        # transform to target models
+        transformed = transform_all_for_target(table, clean_df)
+        # transformed may be a list of (target_table, df) or single tuple
+        if isinstance(transformed, list):
+            for tgt_name, tgt_df in transformed:
+                print(f"Writing {tgt_name} (mode=overwrite)")
+                write_df_to_jdbc(tgt_df, tgt_name, mode="overwrite")
+        else:
+            tgt_name, tgt_df = transformed
+            print(f"Writing {tgt_name} (mode=overwrite)")
+            write_df_to_jdbc(tgt_df, tgt_name, mode="overwrite")
+
+    spark.stop()
+    print("ETL Run Completed.")
+
 if __name__ == "__main__":
-    consumer = create_consumer()
-    print(f"📡 Listening for alerts from {TOPIC}...")
+    run_etl()
+# main.py
+from jobs.etl_job import run_etl
 
-    for message in consumer:
-        cleaned = clean_record(message.value)
-        alerts = check_alerts(cleaned)
+if __name__ == "__main__":
+    run_etl()
+-- Dim Player
+CREATE TABLE IF NOT EXISTS dim_player (
+  playerId VARCHAR(100) PRIMARY KEY,
+  teamId VARCHAR(100),
+  playerName VARCHAR(255),
+  born DATE,
+  birthPlace VARCHAR(255),
+  height DOUBLE,
+  role VARCHAR(100),
+  battingStyle VARCHAR(100),
+  bowlingStyle VARCHAR(100),
+  testPlayerId VARCHAR(100),
+  odiPlayerId VARCHAR(100),
+  t20PlayerId VARCHAR(100)
+);
 
-        if alerts:
-            print(f"\n🚨 ALERTS at {cleaned['location']} (Station {cleaned['station_id']}):")
-            for a in alerts:
-                print("  -", a)
+-- Dim Team
+CREATE TABLE IF NOT EXISTS dim_team (
+  teamId VARCHAR(100) PRIMARY KEY,
+  teamName VARCHAR(255)
+);
+
+-- Dim Venue
+CREATE TABLE IF NOT EXISTS dim_venue (
+  venueId VARCHAR(100) PRIMARY KEY,
+  venueName VARCHAR(255)
+);
+
+-- Dim Match
+CREATE TABLE IF NOT EXISTS dim_match (
+  matchId VARCHAR(100) PRIMARY KEY,
+  seriesId VARCHAR(100),
+  matchName VARCHAR(255),
+  venueId VARCHAR(100),
+  startDate DATE,
+  endDate DATE,
+  team1Score INT,
+  team2Score INT,
+  playerOfTheMatchId VARCHAR(100)
+);
+
+-- Dim Format Stats (unified)
+CREATE TABLE IF NOT EXISTS dim_format_stats (
+  playerId VARCHAR(100),
+  formatType VARCHAR(10), -- ODI/T20/TEST
+  matches DOUBLE,
+  innings DOUBLE,
+  runsScored DOUBLE,
+  ballsFaced DOUBLE,
+  highScore DOUBLE,
+  average DOUBLE,
+  strikeRate DOUBLE,
+  notouts DOUBLE,
+  fours DOUBLE,
+  sixes DOUBLE,
+  fifties DOUBLE,
+  hundreds DOUBLE,
+  doubleHundreds DOUBLE,
+  ballsBowled DOUBLE,
+  runsConceded DOUBLE,
+  wickets DOUBLE,
+  bowlingAverage DOUBLE,
+  economy DOUBLE,
+  bowlingStrikeRate DOUBLE,
+  bestBowlingInInnings VARCHAR(50),
+  bestBowlingInMatch VARCHAR(50),
+  fiveWicketHauls DOUBLE,
+  tenWicketHauls DOUBLE,
+  PRIMARY KEY (playerId, formatType)
+);
+
+-- Fact: Ball By Ball
+CREATE TABLE IF NOT EXISTS fact_ballbyball (
+  match_id VARCHAR(100),
+  inning INT,
+  `over` INT,
+  ball INT,
+  batting_team_id VARCHAR(100),
+  bowling_team_id VARCHAR(100),
+  striker_id VARCHAR(100),
+  non_striker_id VARCHAR(100),
+  bowler_id VARCHAR(100),
+  ball_speed DOUBLE,
+  runs_batsman INT,
+  runs_extras INT,
+  extras_type VARCHAR(50),
+  is_wicket INT,
+  wicket_kind VARCHAR(50),
+  wicket_player_out_id VARCHAR(100),
+  wicket_fielder_id VARCHAR(100)
+);
+
+-- Fact: Player Match Stats
+CREATE TABLE IF NOT EXISTS fact_player_match_stats (
+  matchId VARCHAR(100),
+  playerId VARCHAR(100),
+  runsScored DOUBLE,
+  ballsFaced DOUBLE,
+  runsConceded DOUBLE,
+  wickets DOUBLE,
+  ballsBowled DOUBLE,
+  oversBowled DOUBLE,
+  strikeRate DOUBLE,
+  economy DOUBLE,
+  PRIMARY KEY (matchId, playerId)
+);
+
+-- dim_player_stats_per_venue (if used)
+CREATE TABLE IF NOT EXISTS dim_player_stats_per_venue (
+  playerId VARCHAR(100),
+  venueId VARCHAR(100),
+  matches INT,
+  runsScored INT,
+  wickets INT,
+  PRIMARY KEY (playerId, venueId)
+);
+
+
