@@ -1,19 +1,24 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, FloatType
+from pyspark.sql.types import StructType, StructField, IntegerType, FloatType, StringType
+
 from etl.validate import validate_sample_t20_match
-from etl.transform import transform_sample_t20_match_to_fact_ballbyball, build_player_match_stats_from_ballbyball
+from etl.transform import (
+    transform_sample_t20_match_to_fact_ballbyball,
+    build_player_match_stats_from_ballbyball
+)
 from etl.load import write_df_to_jdbc
+
 
 def run_streaming():
     spark = (
         SparkSession.builder
-        .appName("CricketKafkaStreaming")
-        .config("spark.jars", "/path/to/mysql-connector-j-9.4.0.jar")  # adjust path
+        .appName("CricketKafkaStreamingETL")
+        .config("spark.jars", "/spark/jars/mysql-connector-j-9.4.0.jar")
         .getOrCreate()
     )
 
-    # Kafka source config
+    # === 1. Kafka source ===
     kafka_df = (
         spark.readStream
         .format("kafka")
@@ -23,7 +28,7 @@ def run_streaming():
         .load()
     )
 
-    # Define schema for ball-by-ball JSON
+    # === 2. Schema for cricket ball events ===
     ball_schema = StructType([
         StructField("matchId", IntegerType()),
         StructField("inning", IntegerType()),
@@ -44,67 +49,145 @@ def run_streaming():
         StructField("wicketFielderId", IntegerType())
     ])
 
-    # Parse JSON from Kafka "value" field
-    parsed_df = kafka_df.selectExpr("CAST(value AS STRING) as json") \
-        .select(from_json(col("json"), ball_schema).alias("data")) \
+    parsed_df = (
+        kafka_df.selectExpr("CAST(value AS STRING) as json")
+        .select(from_json(col("json"), ball_schema).alias("data"))
         .select("data.*")
+    )
 
-    # Validate (reusing batch validation if possible)
+    # === 3. Validation ===
     clean_df = validate_sample_t20_match(parsed_df)
 
-    # Transform → fact tables
+    # === 4. Transform into target models ===
     fact_ballbyball = transform_sample_t20_match_to_fact_ballbyball(clean_df)
     fact_player_stats = build_player_match_stats_from_ballbyball(fact_ballbyball)
 
-    # Write fact_ballbyball to MySQL
-    query1 = (
+    # === 5a. Sink 1: Store in cricket_verified (MySQL) ===
+    query_fact_ball = (
         fact_ballbyball.writeStream
-        .foreachBatch(lambda df, epochId: write_df_to_jdbc(df, "fact_ballbyball", mode="append"))
+        .foreachBatch(lambda df, epochId: write_df_to_jdbc(df, "fact_ballbyball", "append"))
         .outputMode("append")
         .start()
     )
 
-    # Write fact_player_match_stats to MySQL
-    query2 = (
+    query_fact_player = (
         fact_player_stats.writeStream
-        .foreachBatch(lambda df, epochId: write_df_to_jdbc(df, "fact_player_match_stats", mode="append"))
+        .foreachBatch(lambda df, epochId: write_df_to_jdbc(df, "fact_player_match_stats", "append"))
         .outputMode("append")
         .start()
     )
 
+    # === 5b. Sink 2: Register as in-memory views for business queries ===
+    fact_ballbyball.createOrReplaceTempView("live_fact_ballbyball")
+    fact_player_stats.createOrReplaceTempView("live_fact_player_match_stats")
+
+    # Example: business query → top scorers in current stream
+    top_scorers = spark.sql("""
+        SELECT playerId, SUM(runsScored) as totalRuns
+        FROM live_fact_player_match_stats
+        GROUP BY playerId
+        ORDER BY totalRuns DESC
+        LIMIT 10
+    """)
+
+    # Write business query result into memory for dashboarding
+    query_top_scorers = (
+        top_scorers.writeStream
+        .outputMode("complete")
+        .format("memory")
+        .queryName("top_scorers_view")
+        .start()
+    )
+
+    # Keep running until terminated
     spark.streams.awaitAnyTermination()
+
 
 if __name__ == "__main__":
     run_streaming()
 
-
+producdr
 from kafka import KafkaProducer
-import json, time
+import json
+import time
+import mysql.connector
 
-producer = KafkaProducer(bootstrap_servers="localhost:9092")
 
-sample_event = {
-    "matchId": 101,
-    "inning": 1,
-    "over": 5,
-    "ball": 3,
-    "battingTeamId": 1,
-    "bowlingTeamId": 2,
-    "strikerId": 15,
-    "nonStrikerId": 22,
-    "bowlerId": 30,
-    "ballSpeed": 138.5,
-    "runsBatsman": 4,
-    "runsExtras": 0,
-    "extrasType": None,
-    "is_wicket": 0,
-    "wicketKind": None,
-    "wicketPlayerOutId": None,
-    "wicketFielderId": None
-}
+def run_producer():
+    # connect to Kafka broker
+    producer = KafkaProducer(
+        bootstrap_servers="localhost:9092",
+        value_serializer=lambda v: json.dumps(v).encode("utf-8")
+    )
 
-for i in range(20):
-    producer.send("cricket.match.ball", json.dumps(sample_event).encode("utf-8"))
-    time.sleep(1)
+    # connect to MySQL source (cricket db)
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="password",   # 🔑 replace with your MySQL password
+        database="cricket"
+    )
+    cursor = conn.cursor(dictionary=True)
 
-producer.flush()
+    # pull all events from sample_t20_match
+    cursor.execute("""
+        SELECT match_id AS matchId,
+               inning,
+               over,
+               ball,
+               batting_team_id AS battingTeamId,
+               bowling_team_id AS bowlingTeamId,
+               striker_id AS strikerId,
+               non_striker_id AS nonStrikerId,
+               bowler_id AS bowlerId,
+               ball_speed AS ballSpeed,
+               runs_batsman AS runsBatsman,
+               runs_extras AS runsExtras,
+               extras_type AS extrasType,
+               wicket_is_wicket AS is_wicket,
+               wicket_kind AS wicketKind,
+               wicket_player_out_id AS wicketPlayerOutId,
+               wicket_fielder_id AS wicketFielderId
+        FROM sample_t20_match
+        ORDER BY match_id, inning, over, ball
+    """)
+
+    rows = cursor.fetchall()
+    for row in rows:
+        producer.send("cricket.match.ball", row)
+        print(f"Sent event: {row}")
+        time.sleep(1)  # simulate real-time streaming
+
+    producer.flush()
+    cursor.close()
+    conn.close()
+
+
+if __name__ == "__main__":
+    run_producer()
+
+co sumwr
+
+from kafka import KafkaConsumer
+import json
+
+
+def run_consumer():
+    consumer = KafkaConsumer(
+        "cricket.match.ball",
+        bootstrap_servers="localhost:9092",
+        auto_offset_reset="earliest",
+        enable_auto_commit=True,
+        group_id="cricket-consumer",
+        value_deserializer=lambda v: json.loads(v.decode("utf-8"))
+    )
+
+    print("Listening for cricket.match.ball events...\n")
+    for message in consumer:
+        print(f"Received: {message.value}")
+
+
+if __name__ == "__main__":
+    run_consumer()
+
+
