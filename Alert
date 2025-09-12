@@ -1,458 +1,110 @@
-8# etl/transform.py
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import lit, col, sum as spark_sum, count as spark_count, when
-
-# --- DIMENSIONS ---
-
-def transform_matches_info(df: DataFrame) -> DataFrame:
-    return df.select(
-        col("matchId"),
-        col("seriesId"),
-        col("matchName"),
-        col("venueId"),
-        col("startDate"),
-        col("endDate"),
-        col("team1Score"),
-        col("team2Score"),
-        col("playerOfTheMatchId")
-    )
-
-def transform_playerinfo(df: DataFrame) -> DataFrame:
-    return df.select(
-        col("playerId"),
-        col("teamId"),
-        col("playerName"),
-        col("born"),
-        col("birthPlace"),
-        col("height"),
-        col("role"),
-        col("battingStyle"),
-        col("bowlingStyle"),
-        col("testPlayerId"),
-        col("odiPlayerId"),
-        col("t20PlayerId")
-    )
-
-def transform_teamdetails(df: DataFrame) -> DataFrame:
-    return df.select(col("teamId"), col("teamName"))
-
-def transform_venuedetails(df: DataFrame) -> DataFrame:
-    return df.select(col("venueId"), col("venueName"))
-
-def transform_formatstats(df: DataFrame, fmt: str) -> DataFrame:
-    # unify playerId
-    for alt in ["playerId", "odiPlayerId", "t20PlayerId", "testPlayerId"]:
-        if alt in df.columns and alt != "playerId":
-            df = df.withColumnRenamed(alt, "playerId")
-    return df.select(
-        col("playerId"), col("matches"), col("innings"), col("runsScored"),
-        col("ballsFaced"), col("highScore"), col("average"), col("strikeRate"),
-        col("notouts"), col("fours"), col("sixes"), col("fifties"),
-        col("hundreds"), col("doubleHundreds"),
-        col("bowlingInnings"), col("ballsBowled"), col("runsConceded"),
-        col("wickets"), col("bowlingAverage"), col("economy"),
-        col("bowlingStrikeRate"), col("bestBowlingInInnings"),
-        col("bestBowlingInMatch"), col("fiveWicketHauls"), col("tenWicketHauls")
-    ).withColumn("formatType", lit(fmt.upper()))
-
-def transform_playerstatspervenue(df: DataFrame) -> DataFrame:
-    return df.select(
-        col("playerId"),
-        col("venueId"),
-        col("matches"),
-        col("runsScored"),
-        col("wickets")
-    )
-
-# --- FACTS ---
-
-def transform_sample_t20_match_to_fact_ballbyball(df: DataFrame) -> DataFrame:
-    # flatten nested columns
-    renames = {
-        "wicket.is_wicket": "is_wicket",
-        "wicket.kind": "wicketKind",
-        "wicket.player_out_id": "wicketPlayerOutId",
-        "wicket.fielder_id": "wicketFielderId"
-    }
-    for old, new in renames.items():
-        if old in df.columns:
-            df = df.withColumnRenamed(old, new)
-    return df.select(
-        col("match_id").alias("matchId"),
-        col("inning"),
-        col("over"),
-        col("ball"),
-        col("batting_team_id").alias("battingTeamId"),
-        col("bowling_team_id").alias("bowlingTeamId"),
-        col("striker_id").alias("strikerId"),
-        col("non_striker_id").alias("nonStrikerId"),
-        col("bowler_id").alias("bowlerId"),
-        col("ball_speed").alias("ballSpeed"),
-        col("runs_batsman").alias("runsBatsman"),
-        col("runs_extras").alias("runsExtras"),
-        col("extras_type").alias("extrasType"),
-        col("is_wicket"),
-        col("wicketKind"),
-        col("wicketPlayerOutId"),
-        col("wicketFielderId")
-    )
-
-def build_player_match_stats_from_ballbyball(ball_df: DataFrame) -> DataFrame:
-    # Batsman side
-    batsman_agg = (
-        ball_df.groupBy("matchId", "strikerId")
-        .agg(
-            spark_sum("runsBatsman").alias("runsScored"),
-            spark_count(when(col("runsBatsman") >= 0, True)).alias("ballsFaced")
-        )
-        .withColumnRenamed("strikerId", "playerId")
-    )
-
-    # Bowler side
-    bowler_agg = (
-        ball_df.groupBy("matchId", "bowlerId")
-        .agg(
-            spark_sum("runsBatsman").alias("runsConceded"),
-            spark_sum(when(col("is_wicket") == 1, 1).otherwise(0)).alias("wickets"),
-            spark_count(when(col("bowlerId").isNotNull(), True)).alias("ballsBowled")
-        )
-        .withColumnRenamed("bowlerId", "playerId")
-    )
-
-    # Merge both
-    combined = batsman_agg.join(bowler_agg, on=["matchId", "playerId"], how="fullouter")
-    combined = combined.na.fill(0, subset=["runsScored","ballsFaced","runsConceded","wickets","ballsBowled"])
-    combined = combined.withColumn("strikeRate", when(col("ballsFaced") > 0, (col("runsScored")*100.0)/col("ballsFaced")).otherwise(0))
-    combined = combined.withColumn("oversBowled", when(col("ballsBowled") > 0, col("ballsBowled")/6.0).otherwise(0))
-    combined = combined.withColumn("economy", when(col("oversBowled") > 0, col("runsConceded")/col("oversBowled")).otherwise(0))
-    return combined
-
--- ========================
--- DIMENSIONS
--- ========================
-
-DROP TABLE IF EXISTS dim_player;
-CREATE TABLE dim_player (
-    playerId INT PRIMARY KEY,
-    teamId INT,
-    playerName VARCHAR(255),
-    born DATE,
-    birthPlace VARCHAR(255),
-    height VARCHAR(20),
-    role VARCHAR(50),
-    battingStyle VARCHAR(50),
-    bowlingStyle VARCHAR(50),
-    testPlayerId INT,
-    odiPlayerId INT,
-    t20PlayerId INT,
-    FOREIGN KEY (teamId) REFERENCES dim_team(teamId)
-);
-
-DROP TABLE IF EXISTS dim_team;
-CREATE TABLE dim_team (
-    teamId INT PRIMARY KEY,
-    teamName VARCHAR(255)
-);
-
-DROP TABLE IF EXISTS dim_venue;
-CREATE TABLE dim_venue (
-    venueId INT PRIMARY KEY,
-    venueName VARCHAR(255)
-);
-
-DROP TABLE IF EXISTS dim_match;
-CREATE TABLE dim_match (
-    matchId INT PRIMARY KEY,
-    seriesId INT,
-    matchName VARCHAR(255),
-    venueId INT,
-    startDate DATE,
-    endDate DATE,
-    team1Score INT,
-    team2Score INT,
-    playerOfTheMatchId INT,
-    FOREIGN KEY (venueId) REFERENCES dim_venue(venueId),
-    FOREIGN KEY (playerOfTheMatchId) REFERENCES dim_player(playerId)
-);
-
-DROP TABLE IF EXISTS dim_format_stats;
-CREATE TABLE dim_format_stats (
-    playerId INT,
-    matches INT,
-    innings INT,
-    runsScored INT,
-    ballsFaced INT,
-    highScore INT,
-    average FLOAT,
-    strikeRate FLOAT,
-    notouts INT,
-    fours INT,
-    sixes INT,
-    fifties INT,
-    hundreds INT,
-    doubleHundreds INT,
-    bowlingInnings INT,
-    ballsBowled INT,
-    runsConceded INT,
-    wickets INT,
-    bowlingAverage FLOAT,
-    economy FLOAT,
-    bowlingStrikeRate FLOAT,
-    bestBowlingInInnings VARCHAR(20),
-    bestBowlingInMatch VARCHAR(20),
-    fiveWicketHauls INT,
-    tenWicketHauls INT,
-    formatType VARCHAR(10),
-    FOREIGN KEY (playerId) REFERENCES dim_player(playerId)
-);
-
-DROP TABLE IF EXISTS dim_player_stats_per_venue;
-CREATE TABLE dim_player_stats_per_venue (
-    playerId INT,
-    venueId INT,
-    matches INT,
-    runsScored INT,
-    wickets INT,
-    PRIMARY KEY (playerId, venueId),
-    FOREIGN KEY (playerId) REFERENCES dim_player(playerId),
-    FOREIGN KEY (venueId) REFERENCES dim_venue(venueId)
-);
-
--- ========================
--- FACTS
--- ========================
-
-DROP TABLE IF EXISTS fact_ballbyball;
-CREATE TABLE fact_ballbyball (
-    matchId INT,
-    inning INT,
-    over INT,
-    ball INT,
-    battingTeamId INT,
-    bowlingTeamId INT,
-    strikerId INT,
-    nonStrikerId INT,
-    bowlerId INT,
-    ballSpeed FLOAT,
-    runsBatsman INT,
-    runsExtras INT,
-    extrasType VARCHAR(50),
-    is_wicket TINYINT,
-    wicketKind VARCHAR(50),
-    wicketPlayerOutId INT,
-    wicketFielderId INT,
-    PRIMARY KEY (matchId, inning, over, ball),
-    FOREIGN KEY (matchId) REFERENCES dim_match(matchId),
-    FOREIGN KEY (battingTeamId) REFERENCES dim_team(teamId),
-    FOREIGN KEY (bowlingTeamId) REFERENCES dim_team(teamId),
-    FOREIGN KEY (strikerId) REFERENCES dim_player(playerId),
-    FOREIGN KEY (nonStrikerId) REFERENCES dim_player(playerId),
-    FOREIGN KEY (bowlerId) REFERENCES dim_player(playerId),
-    FOREIGN KEY (wicketPlayerOutId) REFERENCES dim_player(playerId),
-    FOREIGN KEY (wicketFielderId) REFERENCES dim_player(playerId)
-);
-
-DROP TABLE IF EXISTS fact_player_match_stats;
-CREATE TABLE fact_player_match_stats (
-    matchId INT,
-    playerId INT,
-    runsScored INT,
-    ballsFaced INT,
-    runsConceded INT,
-    wickets INT,
-    ballsBowled INT,
-    strikeRate FLOAT,
-    oversBowled FLOAT,
-    economy FLOAT,
-    PRIMARY KEY (matchId, playerId),
-    FOREIGN KEY (matchId) REFERENCES dim_match(matchId),
-    FOREIGN KEY (playerId) REFERENCES dim_player(playerId)
-);
-import sys
 from pyspark.sql import SparkSession
-from config.db_config import DB_CONFIG
-from etl.extract import extract_table
-from etl.validate import (
-    validate_matches_info, validate_playerinfo, validate_format_stats,
-    validate_teamdetails, validate_venuedetails, validate_sample_t20_match
-)
-from etl.transform import transform_all_for_target
+from pyspark.sql.functions import from_json, col
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, FloatType
+from etl.validate import validate_sample_t20_match
+from etl.transform import transform_sample_t20_match_to_fact_ballbyball, build_player_match_stats_from_ballbyball
 from etl.load import write_df_to_jdbc
 
-
-def run_etl():
-    # SparkSession (no need to set spark.jars if jar is in $SPARK_HOME/jars)
+def run_streaming():
     spark = (
         SparkSession.builder
-        .appName("CricketETL")
+        .appName("CricketKafkaStreaming")
+        .config("spark.jars", "/path/to/mysql-connector-j-9.4.0.jar")  # adjust path
         .getOrCreate()
     )
 
-    # list of source tables to process in order
-    source_tables = [
-        "teamdetails", "venuedetails", "playerinfo", "matches_info",
-        "odiformatstats", "t20formatstats", "testformatstats",
-        "playerstatspervenue", "sample_t20_match"
-    ]
+    # Kafka source config
+    kafka_df = (
+        spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", "localhost:9092")
+        .option("subscribe", "cricket.match.ball")
+        .option("startingOffsets", "latest")
+        .load()
+    )
 
-    for table in source_tables:
-        print(f"==== Processing source table: {table} ====")
-        raw_df = extract_table(spark, table)
+    # Define schema for ball-by-ball JSON
+    ball_schema = StructType([
+        StructField("matchId", IntegerType()),
+        StructField("inning", IntegerType()),
+        StructField("over", IntegerType()),
+        StructField("ball", IntegerType()),
+        StructField("battingTeamId", IntegerType()),
+        StructField("bowlingTeamId", IntegerType()),
+        StructField("strikerId", IntegerType()),
+        StructField("nonStrikerId", IntegerType()),
+        StructField("bowlerId", IntegerType()),
+        StructField("ballSpeed", FloatType()),
+        StructField("runsBatsman", IntegerType()),
+        StructField("runsExtras", IntegerType()),
+        StructField("extrasType", StringType()),
+        StructField("is_wicket", IntegerType()),
+        StructField("wicketKind", StringType()),
+        StructField("wicketPlayerOutId", IntegerType()),
+        StructField("wicketFielderId", IntegerType())
+    ])
 
-        # validate based on table
-        if table == "matches_info":
-            clean_df = validate_matches_info(raw_df)
-        elif table == "playerinfo":
-            clean_df = validate_playerinfo(raw_df)
-        elif table in ["odiformatstats", "t20formatstats", "testformatstats"]:
-            clean_df = validate_format_stats(raw_df, table)
-        elif table == "teamdetails":
-            clean_df = validate_teamdetails(raw_df)
-        elif table == "venuedetails":
-            clean_df = validate_venuedetails(raw_df)
-        elif table == "sample_t20_match":
-            clean_df = validate_sample_t20_match(raw_df)
-        else:
-            # generic cleaning for playerstatspervenue etc.
-            clean_df = raw_df.dropDuplicates()
+    # Parse JSON from Kafka "value" field
+    parsed_df = kafka_df.selectExpr("CAST(value AS STRING) as json") \
+        .select(from_json(col("json"), ball_schema).alias("data")) \
+        .select("data.*")
 
-        # transform to target models
-        transformed = transform_all_for_target(table, clean_df)
+    # Validate (reusing batch validation if possible)
+    clean_df = validate_sample_t20_match(parsed_df)
 
-        # transformed may be a list of (target_table, df) or a single tuple
-        if isinstance(transformed, list):
-            for tgt_name, tgt_df in transformed:
-                print(f"Writing {tgt_name} (mode=overwrite)")
-                write_df_to_jdbc(tgt_df, tgt_name, mode="overwrite")
-        else:
-            tgt_name, tgt_df = transformed
-            print(f"Writing {tgt_name} (mode=overwrite)")
-            write_df_to_jdbc(tgt_df, tgt_name, mode="overwrite")
+    # Transform → fact tables
+    fact_ballbyball = transform_sample_t20_match_to_fact_ballbyball(clean_df)
+    fact_player_stats = build_player_match_stats_from_ballbyball(fact_ballbyball)
 
-    spark.stop()
-    print("ETL Job Completed Successfully ✅")
+    # Write fact_ballbyball to MySQL
+    query1 = (
+        fact_ballbyball.writeStream
+        .foreachBatch(lambda df, epochId: write_df_to_jdbc(df, "fact_ballbyball", mode="append"))
+        .outputMode("append")
+        .start()
+    )
 
+    # Write fact_player_match_stats to MySQL
+    query2 = (
+        fact_player_stats.writeStream
+        .foreachBatch(lambda df, epochId: write_df_to_jdbc(df, "fact_player_match_stats", mode="append"))
+        .outputMode("append")
+        .start()
+    )
+
+    spark.streams.awaitAnyTermination()
 
 if __name__ == "__main__":
-    run_etl()
-# etl/transform.py
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import lit, col, concat_ws, sum as spark_sum, count as spark_count, when
-from pyspark.sql.window import Window
+    run_streaming()
 
-def transform_matches_info(df: DataFrame) -> DataFrame:
-    # selected columns for Dim_Match & Fact_MatchSummary (we keep same table name)
-    cols = ["matchId", "seriesId", "matchName", "venueId", "startDate", "endDate", "team1Score", "team2Score", "playerOfTheMatchId"]
-    present = [c for c in cols if c in df.columns]
-    return df.select(*present)
 
-def transform_playerinfo(df: DataFrame) -> DataFrame:
-    cols = ["playerId","teamId","playerName","born","birthPlace","height","role","battingStyle","bowlingStyle","testPlayerId","odiPlayerId","t20PlayerId"]
-    present = [c for c in cols if c in df.columns]
-    return df.select(*present)
+from kafka import KafkaProducer
+import json, time
 
-def transform_teamdetails(df: DataFrame) -> DataFrame:
-    present = [c for c in ["teamId","teamName"] if c in df.columns]
-    return df.select(*present)
+producer = KafkaProducer(bootstrap_servers="localhost:9092")
 
-def transform_venuedetails(df: DataFrame) -> DataFrame:
-    present = [c for c in ["venueId","venueName"] if c in df.columns]
-    return df.select(*present)
+sample_event = {
+    "matchId": 101,
+    "inning": 1,
+    "over": 5,
+    "ball": 3,
+    "battingTeamId": 1,
+    "bowlingTeamId": 2,
+    "strikerId": 15,
+    "nonStrikerId": 22,
+    "bowlerId": 30,
+    "ballSpeed": 138.5,
+    "runsBatsman": 4,
+    "runsExtras": 0,
+    "extrasType": None,
+    "is_wicket": 0,
+    "wicketKind": None,
+    "wicketPlayerOutId": None,
+    "wicketFielderId": None
+}
 
-def transform_formatstats(df: DataFrame, format_label: str) -> DataFrame:
-    # add 'formatType' column to unify ODI/T20/Test stats
-    df = df.withColumn("formatType", lit(format_label))
-    # normalize playerId column name; prefer 'playerId' if present else map relevant id
-    if "playerId" not in df.columns:
-        for alt in ["odiPlayerId","t20PlayerId","testPlayerId"]:
-            if alt in df.columns:
-                df = df.withColumnRenamed(alt, "playerId")
-                break
-    # select common set
-    cols = [c for c in df.columns if c in [
-        "playerId","matches","innings","runsScored","ballsFaced","highScore","average","strikeRate","notouts",
-        "fours","sixes","fifties","hundreds","doubleHundreds","ballsBowled","runsConceded","wickets",
-        "bowlingAverage","economy","bowlingStrikeRate","bestBowlingInInnings","bestBowlingInMatch",
-        "fiveWicketHauls","tenWicketHauls","formatType"
-    ]]
-    return df.select(*cols)
+for i in range(20):
+    producer.send("cricket.match.ball", json.dumps(sample_event).encode("utf-8"))
+    time.sleep(1)
 
-def transform_sample_t20_match_to_fact_ballbyball(df: DataFrame) -> DataFrame:
-    # Rename wicket_is_wicket to is_wicket for clarity if present
-    if "wicket_is_wicket" in df.columns:
-        df = df.withColumnRenamed("wicket_is_wicket","is_wicket")
-    # unify column names if necessary
-    selected = [c for c in [
-        "match_id","inning","over","ball","batting_team_id","bowling_team_id","striker_id","non_striker_id","bowler_id",
-        "ball_speed","runs_batsman","runs_extras","extras_type","is_wicket","wicket_kind","wicket_player_out_id","wicket_fielder_id"
-    ] if c in df.columns]
-    # keep as fact_ballbyball
-    return df.select(*selected)
-
-def build_player_match_stats_from_ballbyball(ball_df: DataFrame) -> DataFrame:
-    # Aggregations per player per match: runs, balls faced, fours, sixes, wickets, overs bowled, runs conceded
-    # Note: input must have match_id, striker_id, bowler_id, runs_batsman, runs_extras, is_wicket
-    # Batsman aggregations
-    batsman_agg = (
-        ball_df.groupBy("match_id", "striker_id")
-        .agg(
-            spark_sum("runs_batsman").alias("runsScored"),
-            spark_count(when(col("runs_batsman") >= 0, True)).alias("ballsFaced")
-        )
-        .withColumnRenamed("striker_id", "playerId")
-        .withColumnRenamed("match_id", "matchId")
-    )
-    # Bowler aggregations
-    bowler_agg = (
-        ball_df.groupBy("match_id", "bowler_id")
-        .agg(
-            spark_sum("runs_batsman").alias("runsConceded"),  # crude: count runs conceded by bowler as runs_batsman + runs_extras could be improved
-            spark_sum(when(col("is_wicket") == 1, 1).otherwise(0)).alias("wickets"),
-            spark_count(when(col("bowler_id").isNotNull(), True)).alias("ballsBowled")
-        )
-        .withColumnRenamed("bowler_id", "playerId")
-        .withColumnRenamed("match_id", "matchId")
-    )
-    # Join batsman and bowler stats into player match stats (union-style)
-    # We'll union and then aggregate by matchId+playerId
-    batsman_sel = batsman_agg.select("matchId","playerId","runsScored","ballsFaced")
-    bowler_sel = bowler_agg.select("matchId","playerId","runsConceded","wickets","ballsBowled")
-    combined = batsman_sel.join(bowler_sel, on=["matchId","playerId"], how="fullouter")
-    # fill nulls
-    combined = combined.na.fill(0, subset=["runsScored","ballsFaced","runsConceded","wickets","ballsBowled"])
-    # compute strikeRate and economy where possible
-    combined = combined.withColumn("strikeRate", when(col("ballsFaced") > 0, (col("runsScored")*100.0)/col("ballsFaced")).otherwise(0))
-    combined = combined.withColumn("oversBowled", when(col("ballsBowled") > 0, (col("ballsBowled")/6.0)).otherwise(0))
-    combined = combined.withColumn("economy", when(col("oversBowled") > 0, col("runsConceded")/col("oversBowled")).otherwise(0))
-    return combined
-
-def transform_all_for_target(table_name: str, df: DataFrame):
-    """
-    Dispatcher that returns (target_table_name, transformed_df)
-    target table names correspond to cricket_verified tables
-    """
-    if table_name == "matches_info":
-        return ("dim_match", transform_matches_info(df))
-    if table_name == "playerinfo":
-        return ("dim_player", transform_playerinfo(df))
-    if table_name == "teamdetails":
-        return ("dim_team", transform_teamdetails(df))
-    if table_name == "venuedetails":
-        return ("dim_venue", transform_venuedetails(df))
-    if table_name == "odiformatstats":
-        return ("dim_format_stats", transform_formatstats(df, "ODI"))
-    if table_name == "t20formatstats":
-        return ("dim_format_stats", transform_formatstats(df, "T20"))
-    if table_name == "testformatstats":
-        return ("dim_format_stats", transform_formatstats(df, "TEST"))
-    if table_name == "sample_t20_match":
-        # produce fact_ballbyball and fact_player_match_stats
-        fact_balls = transform_sample_t20_match_to_fact_ballbyball(df)
-        player_stats = build_player_match_stats_from_ballbyball(fact_balls)
-        return [("fact_ballbyball", fact_balls), ("fact_player_match_stats", player_stats)]
-    if table_name == "playerstatspervenue":
-        # pass through as is, but rename for target
-        return ("dim_player_stats_per_venue", df)
-    # fallback: return raw
-    return (table_name, df)
-
+producer.flush()
