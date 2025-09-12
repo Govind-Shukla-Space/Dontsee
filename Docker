@@ -1,105 +1,152 @@
-# jobs/run_queries.py
-from pyspark.sql import SparkSession
-from config.db_config import DB_CONFIG
+CREATE DATABASE IF NOT EXISTS cricket_verified;
+USE cricket_verified;
 
-def run_batch_queries():
-    spark = (
-        SparkSession.builder
-        .appName("CricketBatchQueries")
-        .config("spark.jars", DB_CONFIG["jdbc_jar"])
-        .getOrCreate()
-    )
+-- =========================
+-- DIMENSIONS
+-- =========================
 
-    # === Load historical data ===
-    dim_player = spark.read.format("jdbc").options(
-        url=DB_CONFIG["target_url"],
-        dbtable="dim_player",
-        user=DB_CONFIG["user"],
-        password=DB_CONFIG["password"],
-        driver=DB_CONFIG["driver"]
-    ).load()
+CREATE TABLE dim_team (
+    teamId       INT PRIMARY KEY,
+    teamName     VARCHAR(100) NOT NULL
+);
 
-    dim_match = spark.read.format("jdbc").options(
-        url=DB_CONFIG["target_url"],
-        dbtable="dim_match",
-        user=DB_CONFIG["user"],
-        password=DB_CONFIG["password"],
-        driver=DB_CONFIG["driver"]
-    ).load()
+CREATE TABLE dim_venue (
+    venueId      INT PRIMARY KEY,
+    venueName    VARCHAR(200) NOT NULL
+);
 
-    fact_stats = spark.read.format("jdbc").options(
-        url=DB_CONFIG["target_url"],
-        dbtable="fact_player_match_stats",
-        user=DB_CONFIG["user"],
-        password=DB_CONFIG["password"],
-        driver=DB_CONFIG["driver"]
-    ).load()
+CREATE TABLE dim_player (
+    playerId     INT PRIMARY KEY,
+    teamId       INT,
+    playerName   VARCHAR(150) NOT NULL,
+    born         DATE NULL,
+    birthPlace   VARCHAR(150),
+    height       VARCHAR(50),
+    role         VARCHAR(50),
+    battingStyle VARCHAR(50),
+    bowlingStyle VARCHAR(50),
+    testPlayerId INT,
+    odiPlayerId  INT,
+    t20PlayerId  INT,
+    CONSTRAINT fk_player_team FOREIGN KEY (teamId)
+        REFERENCES dim_team(teamId)
+);
 
-    # Register temp views
-    dim_player.createOrReplaceTempView("dim_player")
-    dim_match.createOrReplaceTempView("dim_match")
-    fact_stats.createOrReplaceTempView("fact_player_match_stats")
+CREATE TABLE dim_match (
+    matchId            INT PRIMARY KEY,
+    seriesId           INT,
+    matchName          VARCHAR(200),
+    venueId            INT,
+    startDate          DATE,
+    endDate            DATE,
+    team1Score         INT,
+    team2Score         INT,
+    playerOfTheMatchId INT,
+    CONSTRAINT fk_match_venue FOREIGN KEY (venueId)
+        REFERENCES dim_venue(venueId),
+    CONSTRAINT fk_match_pom FOREIGN KEY (playerOfTheMatchId)
+        REFERENCES dim_player(playerId)
+);
 
-    # === Example Historical Queries ===
-    print("\nTop 10 Run Scorers (all time):")
-    top_scorers = spark.sql("""
-        SELECT p.playerName, SUM(f.runsScored) as totalRuns
-        FROM fact_player_match_stats f
-        JOIN dim_player p ON f.playerId = p.playerId
-        GROUP BY p.playerName
-        ORDER BY totalRuns DESC
-        LIMIT 10
-    """)
-    top_scorers.show(truncate=False)
+CREATE TABLE dim_format_stats (
+    playerId           INT,
+    formatType         ENUM('ODI','T20','TEST'),
+    matches            INT,
+    innings            INT,
+    runsScored         INT,
+    ballsFaced         INT,
+    highScore          INT,
+    average            FLOAT,
+    strikeRate         FLOAT,
+    notouts            INT,
+    fours              INT,
+    sixes              INT,
+    fifties            INT,
+    hundreds           INT,
+    doubleHundreds     INT,
+    ballsBowled        INT,
+    runsConceded       INT,
+    wickets            INT,
+    bowlingAverage     FLOAT,
+    economy            FLOAT,
+    bowlingStrikeRate  FLOAT,
+    bestBowlingInInnings VARCHAR(50),
+    bestBowlingInMatch   VARCHAR(50),
+    fiveWicketHauls    INT,
+    tenWicketHauls     INT,
+    PRIMARY KEY (playerId, formatType),
+    CONSTRAINT fk_formatstats_player FOREIGN KEY (playerId)
+        REFERENCES dim_player(playerId)
+);
 
-    print("\nBest Bowlers by Wickets (all time):")
-    top_bowlers = spark.sql("""
-        SELECT p.playerName, SUM(f.wickets) as totalWickets
-        FROM fact_player_match_stats f
-        JOIN dim_player p ON f.playerId = p.playerId
-        GROUP BY p.playerName
-        ORDER BY totalWickets DESC
-        LIMIT 10
-    """)
-    top_bowlers.show(truncate=False)
+CREATE TABLE dim_player_stats_per_venue (
+    playerId   INT,
+    venueId    INT,
+    matches    INT,
+    runsScored INT,
+    wickets    INT,
+    PRIMARY KEY (playerId, venueId),
+    CONSTRAINT fk_psv_player FOREIGN KEY (playerId)
+        REFERENCES dim_player(playerId),
+    CONSTRAINT fk_psv_venue FOREIGN KEY (venueId)
+        REFERENCES dim_venue(venueId)
+);
 
-    spark.stop()
+-- =========================
+-- FACTS
+-- =========================
 
+CREATE TABLE fact_ballbyball (
+    matchId          INT,
+    inning           INT,
+    overNo           INT,
+    ballNo           INT,
+    batting_team_id  INT,
+    bowling_team_id  INT,
+    striker_id       INT,
+    non_striker_id   INT,
+    bowler_id        INT,
+    ball_speed       FLOAT,
+    runs_batsman     INT,
+    runs_extras      INT,
+    extras_type      VARCHAR(50),
+    is_wicket        BOOLEAN,
+    wicket_kind      VARCHAR(50),
+    wicket_player_out_id INT,
+    wicket_fielder_id    INT,
+    PRIMARY KEY (matchId, inning, overNo, ballNo),
+    CONSTRAINT fk_bbb_match FOREIGN KEY (matchId)
+        REFERENCES dim_match(matchId),
+    CONSTRAINT fk_bbb_batting_team FOREIGN KEY (batting_team_id)
+        REFERENCES dim_team(teamId),
+    CONSTRAINT fk_bbb_bowling_team FOREIGN KEY (bowling_team_id)
+        REFERENCES dim_team(teamId),
+    CONSTRAINT fk_bbb_striker FOREIGN KEY (striker_id)
+        REFERENCES dim_player(playerId),
+    CONSTRAINT fk_bbb_bowler FOREIGN KEY (bowler_id)
+        REFERENCES dim_player(playerId),
+    CONSTRAINT fk_bbb_non_striker FOREIGN KEY (non_striker_id)
+        REFERENCES dim_player(playerId),
+    CONSTRAINT fk_bbb_wicket_out FOREIGN KEY (wicket_player_out_id)
+        REFERENCES dim_player(playerId),
+    CONSTRAINT fk_bbb_wicket_fielder FOREIGN KEY (wicket_fielder_id)
+        REFERENCES dim_player(playerId)
+);
 
-if __name__ == "__main__":
-    run_batch_queries()
-# jobs/streaming_queries.py
-from pyspark.sql import SparkSession
-
-def run_streaming_queries():
-    spark = (
-        SparkSession.builder
-        .appName("CricketStreamingQueries")
-        .getOrCreate()
-    )
-
-    # Example: top 10 scorers live
-    live_top_scorers = spark.sql("""
-        SELECT playerId, SUM(runsScored) as totalRuns
-        FROM live_fact_player_match_stats
-        GROUP BY playerId
-        ORDER BY totalRuns DESC
-        LIMIT 10
-    """)
-    live_top_scorers.show(truncate=False)
-
-    # Example: wickets by bowler live
-    live_top_bowlers = spark.sql("""
-        SELECT playerId, SUM(wickets) as totalWickets
-        FROM live_fact_player_match_stats
-        GROUP BY playerId
-        ORDER BY totalWickets DESC
-        LIMIT 10
-    """)
-    live_top_bowlers.show(truncate=False)
-
-    spark.stop()
-
-
-if __name__ == "__main__":
-    run_streaming_queries()
+CREATE TABLE fact_player_match_stats (
+    matchId      INT,
+    playerId     INT,
+    runsScored   INT,
+    ballsFaced   INT,
+    runsConceded INT,
+    wickets      INT,
+    ballsBowled  INT,
+    strikeRate   FLOAT,
+    oversBowled  FLOAT,
+    economy      FLOAT,
+    PRIMARY KEY (matchId, playerId),
+    CONSTRAINT fk_pms_match FOREIGN KEY (matchId)
+        REFERENCES dim_match(matchId),
+    CONSTRAINT fk_pms_player FOREIGN KEY (playerId)
+        REFERENCES dim_player(playerId)
+);
