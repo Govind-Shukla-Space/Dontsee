@@ -1,4 +1,4 @@
-# etl/transform.py
+8# etl/transform.py
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import lit, col, sum as spark_sum, count as spark_count, when
 
@@ -268,4 +268,191 @@ CREATE TABLE fact_player_match_stats (
     FOREIGN KEY (matchId) REFERENCES dim_match(matchId),
     FOREIGN KEY (playerId) REFERENCES dim_player(playerId)
 );
+import sys
+from pyspark.sql import SparkSession
+from config.db_config import DB_CONFIG
+from etl.extract import extract_table
+from etl.validate import (
+    validate_matches_info, validate_playerinfo, validate_format_stats,
+    validate_teamdetails, validate_venuedetails, validate_sample_t20_match
+)
+from etl.transform import transform_all_for_target
+from etl.load import write_df_to_jdbc
+
+
+def run_etl():
+    # SparkSession (no need to set spark.jars if jar is in $SPARK_HOME/jars)
+    spark = (
+        SparkSession.builder
+        .appName("CricketETL")
+        .getOrCreate()
+    )
+
+    # list of source tables to process in order
+    source_tables = [
+        "teamdetails", "venuedetails", "playerinfo", "matches_info",
+        "odiformatstats", "t20formatstats", "testformatstats",
+        "playerstatspervenue", "sample_t20_match"
+    ]
+
+    for table in source_tables:
+        print(f"==== Processing source table: {table} ====")
+        raw_df = extract_table(spark, table)
+
+        # validate based on table
+        if table == "matches_info":
+            clean_df = validate_matches_info(raw_df)
+        elif table == "playerinfo":
+            clean_df = validate_playerinfo(raw_df)
+        elif table in ["odiformatstats", "t20formatstats", "testformatstats"]:
+            clean_df = validate_format_stats(raw_df, table)
+        elif table == "teamdetails":
+            clean_df = validate_teamdetails(raw_df)
+        elif table == "venuedetails":
+            clean_df = validate_venuedetails(raw_df)
+        elif table == "sample_t20_match":
+            clean_df = validate_sample_t20_match(raw_df)
+        else:
+            # generic cleaning for playerstatspervenue etc.
+            clean_df = raw_df.dropDuplicates()
+
+        # transform to target models
+        transformed = transform_all_for_target(table, clean_df)
+
+        # transformed may be a list of (target_table, df) or a single tuple
+        if isinstance(transformed, list):
+            for tgt_name, tgt_df in transformed:
+                print(f"Writing {tgt_name} (mode=overwrite)")
+                write_df_to_jdbc(tgt_df, tgt_name, mode="overwrite")
+        else:
+            tgt_name, tgt_df = transformed
+            print(f"Writing {tgt_name} (mode=overwrite)")
+            write_df_to_jdbc(tgt_df, tgt_name, mode="overwrite")
+
+    spark.stop()
+    print("ETL Job Completed Successfully ✅")
+
+
+if __name__ == "__main__":
+    run_etl()
+# etl/transform.py
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit, col, concat_ws, sum as spark_sum, count as spark_count, when
+from pyspark.sql.window import Window
+
+def transform_matches_info(df: DataFrame) -> DataFrame:
+    # selected columns for Dim_Match & Fact_MatchSummary (we keep same table name)
+    cols = ["matchId", "seriesId", "matchName", "venueId", "startDate", "endDate", "team1Score", "team2Score", "playerOfTheMatchId"]
+    present = [c for c in cols if c in df.columns]
+    return df.select(*present)
+
+def transform_playerinfo(df: DataFrame) -> DataFrame:
+    cols = ["playerId","teamId","playerName","born","birthPlace","height","role","battingStyle","bowlingStyle","testPlayerId","odiPlayerId","t20PlayerId"]
+    present = [c for c in cols if c in df.columns]
+    return df.select(*present)
+
+def transform_teamdetails(df: DataFrame) -> DataFrame:
+    present = [c for c in ["teamId","teamName"] if c in df.columns]
+    return df.select(*present)
+
+def transform_venuedetails(df: DataFrame) -> DataFrame:
+    present = [c for c in ["venueId","venueName"] if c in df.columns]
+    return df.select(*present)
+
+def transform_formatstats(df: DataFrame, format_label: str) -> DataFrame:
+    # add 'formatType' column to unify ODI/T20/Test stats
+    df = df.withColumn("formatType", lit(format_label))
+    # normalize playerId column name; prefer 'playerId' if present else map relevant id
+    if "playerId" not in df.columns:
+        for alt in ["odiPlayerId","t20PlayerId","testPlayerId"]:
+            if alt in df.columns:
+                df = df.withColumnRenamed(alt, "playerId")
+                break
+    # select common set
+    cols = [c for c in df.columns if c in [
+        "playerId","matches","innings","runsScored","ballsFaced","highScore","average","strikeRate","notouts",
+        "fours","sixes","fifties","hundreds","doubleHundreds","ballsBowled","runsConceded","wickets",
+        "bowlingAverage","economy","bowlingStrikeRate","bestBowlingInInnings","bestBowlingInMatch",
+        "fiveWicketHauls","tenWicketHauls","formatType"
+    ]]
+    return df.select(*cols)
+
+def transform_sample_t20_match_to_fact_ballbyball(df: DataFrame) -> DataFrame:
+    # Rename wicket_is_wicket to is_wicket for clarity if present
+    if "wicket_is_wicket" in df.columns:
+        df = df.withColumnRenamed("wicket_is_wicket","is_wicket")
+    # unify column names if necessary
+    selected = [c for c in [
+        "match_id","inning","over","ball","batting_team_id","bowling_team_id","striker_id","non_striker_id","bowler_id",
+        "ball_speed","runs_batsman","runs_extras","extras_type","is_wicket","wicket_kind","wicket_player_out_id","wicket_fielder_id"
+    ] if c in df.columns]
+    # keep as fact_ballbyball
+    return df.select(*selected)
+
+def build_player_match_stats_from_ballbyball(ball_df: DataFrame) -> DataFrame:
+    # Aggregations per player per match: runs, balls faced, fours, sixes, wickets, overs bowled, runs conceded
+    # Note: input must have match_id, striker_id, bowler_id, runs_batsman, runs_extras, is_wicket
+    # Batsman aggregations
+    batsman_agg = (
+        ball_df.groupBy("match_id", "striker_id")
+        .agg(
+            spark_sum("runs_batsman").alias("runsScored"),
+            spark_count(when(col("runs_batsman") >= 0, True)).alias("ballsFaced")
+        )
+        .withColumnRenamed("striker_id", "playerId")
+        .withColumnRenamed("match_id", "matchId")
+    )
+    # Bowler aggregations
+    bowler_agg = (
+        ball_df.groupBy("match_id", "bowler_id")
+        .agg(
+            spark_sum("runs_batsman").alias("runsConceded"),  # crude: count runs conceded by bowler as runs_batsman + runs_extras could be improved
+            spark_sum(when(col("is_wicket") == 1, 1).otherwise(0)).alias("wickets"),
+            spark_count(when(col("bowler_id").isNotNull(), True)).alias("ballsBowled")
+        )
+        .withColumnRenamed("bowler_id", "playerId")
+        .withColumnRenamed("match_id", "matchId")
+    )
+    # Join batsman and bowler stats into player match stats (union-style)
+    # We'll union and then aggregate by matchId+playerId
+    batsman_sel = batsman_agg.select("matchId","playerId","runsScored","ballsFaced")
+    bowler_sel = bowler_agg.select("matchId","playerId","runsConceded","wickets","ballsBowled")
+    combined = batsman_sel.join(bowler_sel, on=["matchId","playerId"], how="fullouter")
+    # fill nulls
+    combined = combined.na.fill(0, subset=["runsScored","ballsFaced","runsConceded","wickets","ballsBowled"])
+    # compute strikeRate and economy where possible
+    combined = combined.withColumn("strikeRate", when(col("ballsFaced") > 0, (col("runsScored")*100.0)/col("ballsFaced")).otherwise(0))
+    combined = combined.withColumn("oversBowled", when(col("ballsBowled") > 0, (col("ballsBowled")/6.0)).otherwise(0))
+    combined = combined.withColumn("economy", when(col("oversBowled") > 0, col("runsConceded")/col("oversBowled")).otherwise(0))
+    return combined
+
+def transform_all_for_target(table_name: str, df: DataFrame):
+    """
+    Dispatcher that returns (target_table_name, transformed_df)
+    target table names correspond to cricket_verified tables
+    """
+    if table_name == "matches_info":
+        return ("dim_match", transform_matches_info(df))
+    if table_name == "playerinfo":
+        return ("dim_player", transform_playerinfo(df))
+    if table_name == "teamdetails":
+        return ("dim_team", transform_teamdetails(df))
+    if table_name == "venuedetails":
+        return ("dim_venue", transform_venuedetails(df))
+    if table_name == "odiformatstats":
+        return ("dim_format_stats", transform_formatstats(df, "ODI"))
+    if table_name == "t20formatstats":
+        return ("dim_format_stats", transform_formatstats(df, "T20"))
+    if table_name == "testformatstats":
+        return ("dim_format_stats", transform_formatstats(df, "TEST"))
+    if table_name == "sample_t20_match":
+        # produce fact_ballbyball and fact_player_match_stats
+        fact_balls = transform_sample_t20_match_to_fact_ballbyball(df)
+        player_stats = build_player_match_stats_from_ballbyball(fact_balls)
+        return [("fact_ballbyball", fact_balls), ("fact_player_match_stats", player_stats)]
+    if table_name == "playerstatspervenue":
+        # pass through as is, but rename for target
+        return ("dim_player_stats_per_venue", df)
+    # fallback: return raw
+    return (table_name, df)
 
